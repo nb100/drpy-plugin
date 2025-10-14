@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"gith
+	"github.com/go-resty/resty/v2"
 	"net"
 	"net/http"
 	"strings"
