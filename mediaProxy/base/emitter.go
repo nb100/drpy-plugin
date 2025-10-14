@@ -2,34 +2,40 @@ package base
 
 import (
 	"io"
+	"sync"
 )
 
 type Emitter struct {
 	pipeReader *io.PipeReader
 	pipeWriter *io.PipeWriter
 	closed     bool
+	mutex      sync.RWMutex
 }
 
 func (em *Emitter) IsClosed() bool {
+	em.mutex.RLock()
+	defer em.mutex.RUnlock()
 	return em.closed
 }
 
 func (em *Emitter) Read(b []byte) (int, error) {
-	n, err := em.pipeReader.Read(b)
-	if err != nil {
-		em.Close()
-		return 0, err
+	em.mutex.RLock()
+	if em.closed {
+		em.mutex.RUnlock()
+		return 0, io.EOF
 	}
-	return n, nil
+	em.mutex.RUnlock()
+	return em.pipeReader.Read(b)
 }
 
 func (em *Emitter) Write(b []byte) (int, error) {
-	n, err := em.pipeWriter.Write(b)
-	if err != nil {
-		em.Close()
-		return 0, err
+	em.mutex.RLock()
+	if em.closed {
+		em.mutex.RUnlock()
+		return 0, io.ErrClosedPipe
 	}
-	return n, nil
+	em.mutex.RUnlock()
+	return em.pipeWriter.Write(b)
 }
 
 func (em *Emitter) WriteString(s string) (int, error) {
@@ -37,6 +43,11 @@ func (em *Emitter) WriteString(s string) (int, error) {
 }
 
 func (em *Emitter) Close() error {
+	em.mutex.Lock()
+	defer em.mutex.Unlock()
+	if em.closed {
+		return nil // 已经关闭，直接返回
+	}
 	em.closed = true
 	em.pipeReader.Close()
 	em.pipeWriter.Close()

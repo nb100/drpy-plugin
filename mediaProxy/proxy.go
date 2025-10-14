@@ -121,6 +121,7 @@ func ConcurrentDownload(downloadUrl string, rangeStart int64, rangeEnd int64, fi
 
 	defer func() {
 		p.ProxyStop()
+		emitter.Close() // 确保在函数结束时关闭emitter
 		p = nil
 	}()
 
@@ -129,7 +130,6 @@ func ConcurrentDownload(downloadUrl string, rangeStart int64, rangeEnd int64, fi
 
 		if len(buffer) == 0 {
 			p.ProxyStop()
-			emitter.Close()
 			logrus.Debugf("ProxyRead执行失败")
 			buffer = nil
 			return
@@ -139,7 +139,6 @@ func ConcurrentDownload(downloadUrl string, rangeStart int64, rangeEnd int64, fi
 
 		if err != nil {
 			p.ProxyStop()
-			emitter.Close()
 			logrus.Errorf("emitter写入失败, 错误: %+v", err)
 			buffer = nil
 			return
@@ -147,7 +146,6 @@ func ConcurrentDownload(downloadUrl string, rangeStart int64, rangeEnd int64, fi
 
 		if p.CurrentOffset >= rangeEnd {
 			p.ProxyStop()
-			emitter.Close()
 			logrus.Debugf("所有服务已经完成大小: %+v", totalLength)
 			buffer = nil
 			return
@@ -456,10 +454,10 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 	var responseHeaders interface{}
 	responseHeaders, found = mediaCache.Get(headersKey)
 	if !found || curTime-lastModified > 60 {
-		// 关闭 Idle 超时设置
-		base.IdleConnTimeout = 0
-		resp, err := base.RestyClient.
-			SetTimeout(0).
+		// 创建专用的客户端用于获取头信息，避免修改全局设置
+		headClient := base.NewRestyClient()
+		resp, err := headClient.
+			SetTimeout(30*time.Second).
 			SetRetryCount(3).
 			SetCookieJar(jar).
 			R().
@@ -635,30 +633,40 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 			} else {
 				splitSize = int64(128 * 1024)
 			}
+
+			// 设置正确的Range响应头
 			responseHeaders.(http.Header).Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, contentSize))
+			responseHeaders.(http.Header).Set("Content-Length", strconv.FormatInt(rangeEnd-rangeStart+1, 10))
+			responseHeaders.(http.Header).Set("Accept-Ranges", "bytes")
+
+			// 先设置响应头，再开始数据传输
+			for key, values := range responseHeaders.(http.Header) {
+				if strings.EqualFold(strings.ToLower(key), "connection") || strings.EqualFold(strings.ToLower(key), "proxy-connection") {
+					continue
+				}
+				w.Header().Set(key, strings.Join(values, ","))
+			}
+			w.Header().Set("Connection", "keep-alive")
+			w.WriteHeader(statusCode) // 206 for partial content
 
 			rp, wp := io.Pipe()
 			emitter := base.NewEmitter(rp, wp)
 
+			defer func() {
+				if !emitter.IsClosed() {
+					emitter.Close()
+					logrus.Debugf("handleGetMethod emitter 已关闭-支持断点续传")
+				}
+			}()
+
 			go ConcurrentDownload(url, rangeStart, rangeEnd, contentSize, splitSize, numTasks, emitter, req)
 			io.Copy(pw, emitter)
-
-			defer func() {
-				emitter.Close()
-				logrus.Debugf("handleGetMethod emitter 已关闭-支持断点续传")
-			}()
 		} else {
-			statusCode = 200
+			// Range超出文件大小，返回416错误
+			statusCode = 416
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", contentSize))
+			w.WriteHeader(statusCode)
 		}
-
-		for key, values := range responseHeaders.(http.Header) {
-			if strings.EqualFold(strings.ToLower(key), "connection") || strings.EqualFold(strings.ToLower(key), "proxy-connection") {
-				continue
-			}
-			w.Header().Set(key, strings.Join(values, ","))
-		}
-		w.Header().Set("Connection", "keep-alive")
-		w.WriteHeader(statusCode)
 	}
 }
 
@@ -818,7 +826,8 @@ func shouldFilterHeaderName(key string) bool {
 		return false
 	}
 	key = strings.ToLower(key)
-	return key == "range" || key == "host" || key == "http-client-ip" || key == "remote-addr" || key == "accept-encoding"
+	// 移除对 range 头的过滤，允许 Range 请求正常转发
+	return key == "host" || key == "http-client-ip" || key == "remote-addr" || key == "accept-encoding"
 }
 
 func main() {
