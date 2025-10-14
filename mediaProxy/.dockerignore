@@ -1,0 +1,45 @@
+# Git相关
+.git
+.gitignore
+
+# 构建产物
+build/
+dist/
+*.exe
+mediaProxy
+
+# 开发工具
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 日志文件
+*.log
+
+# 临时文件
+tmp/
+temp/
+
+# 测试覆盖率
+*.out
+coverage.html
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 文档
+README.md
+LICENSE
+*.md
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Docker相关
+Dockerfile*
+docker-compose*.yml
+.dockerignore
