@@ -2,11 +2,13 @@ package main
 
 import (
 	// 标准库
-	"bufio"
+
 	"bytes"
+	"context"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -41,22 +43,31 @@ var authKey string
 type Chunk struct {
 	startOffset int64
 	endOffset   int64
-	buffer      []byte
+	bufferChan  chan []byte
 }
 
 func newChunk(start int64, end int64) *Chunk {
 	return &Chunk{
 		startOffset: start,
 		endOffset:   end,
+		bufferChan:  make(chan []byte, 1),
 	}
 }
 
-func (ch *Chunk) get() []byte {
-	return ch.buffer
+func (ch *Chunk) get(ctx context.Context) []byte {
+	select {
+	case <-ctx.Done():
+		return nil
+	case buf := <-ch.bufferChan:
+		return buf
+	}
 }
 
 func (ch *Chunk) put(buffer []byte) {
-	ch.buffer = buffer
+	select {
+	case ch.bufferChan <- buffer:
+	default:
+	}
 }
 
 type ProxyDownloadStruct struct {
@@ -74,9 +85,12 @@ type ProxyDownloadStruct struct {
 	ThreadCount          int64
 	DownloadUrl          string
 	CookieJar            *cookiejar.Jar
+	Ctx                  context.Context
+	Cancel               context.CancelFunc
 }
 
-func newProxyDownloadStruct(downloadUrl string, proxyTimeout int64, maxBuferredChunk int64, chunkSize int64, startOffset int64, endOffset int64, numTasks int64, cookiejar *cookiejar.Jar) *ProxyDownloadStruct {
+func newProxyDownloadStruct(parentCtx context.Context, downloadUrl string, proxyTimeout int64, maxBuferredChunk int64, chunkSize int64, startOffset int64, endOffset int64, numTasks int64, cookiejar *cookiejar.Jar) *ProxyDownloadStruct {
+	ctx, cancel := context.WithCancel(parentCtx)
 	return &ProxyDownloadStruct{
 		ProxyRunning:         true,
 		MaxBufferedChunk:     int64(maxBuferredChunk),
@@ -91,10 +105,12 @@ func newProxyDownloadStruct(downloadUrl string, proxyTimeout int64, maxBuferredC
 		ThreadCount:          numTasks,
 		DownloadUrl:          downloadUrl,
 		CookieJar:            cookiejar,
+		Ctx:                  ctx,
+		Cancel:               cancel,
 	}
 }
 
-func ConcurrentDownload(downloadUrl string, rangeStart int64, rangeEnd int64, fileSize int64, splitSize int64, numTasks int64, emitter *base.Emitter, req *http.Request) {
+func ConcurrentDownload(ctx context.Context, downloadUrl string, rangeStart int64, rangeEnd int64, fileSize int64, splitSize int64, numTasks int64, emitter *base.Emitter, req *http.Request) {
 	jar, _ := cookiejar.New(nil)
 	cookies := req.Cookies()
 	if len(cookies) > 0 {
@@ -114,7 +130,7 @@ func ConcurrentDownload(downloadUrl string, rangeStart int64, rangeEnd int64, fi
 
 	logrus.Debugf("正在处理: %+v, rangeStart: %+v, rangeEnd: %+v, contentLength :%+v, splitSize: %+v, numSplits: %+v, numTasks: %+v", downloadUrl, rangeStart, rangeEnd, totalLength, splitSize, numSplits, numSplits)
 	maxChunks := int64(128*1024*1024) / splitSize
-	p := newProxyDownloadStruct(downloadUrl, proxyTimeout, maxChunks, splitSize, rangeStart, rangeEnd, numTasks, jar)
+	p := newProxyDownloadStruct(ctx, downloadUrl, proxyTimeout, maxChunks, splitSize, rangeStart, rangeEnd, numTasks, jar)
 	for numSplit := 0; numSplit < int(numSplits); numSplit++ {
 		go p.ProxyWorker(req)
 	}
@@ -128,9 +144,9 @@ func ConcurrentDownload(downloadUrl string, rangeStart int64, rangeEnd int64, fi
 	for {
 		buffer := p.ProxyRead()
 
-		if len(buffer) == 0 {
+		if buffer == nil || len(buffer) == 0 {
 			p.ProxyStop()
-			logrus.Debugf("ProxyRead执行失败")
+			logrus.Debugf("ProxyRead执行失败或返回空: buffer == nil? %v, len=%d", buffer == nil, len(buffer))
 			buffer = nil
 			return
 		}
@@ -138,13 +154,15 @@ func ConcurrentDownload(downloadUrl string, rangeStart int64, rangeEnd int64, fi
 		_, err := emitter.Write(buffer)
 
 		if err != nil {
+			if !strings.Contains(err.Error(), "write on closed pipe") && !strings.Contains(err.Error(), "client disconnected") && !strings.Contains(err.Error(), "forcibly closed") && !errors.Is(err, syscall.EPIPE) && !errors.Is(err, syscall.ECONNRESET) {
+				logrus.Errorf("emitter写入失败, 错误: %+v", err)
+			}
 			p.ProxyStop()
-			logrus.Errorf("emitter写入失败, 错误: %+v", err)
 			buffer = nil
 			return
 		}
 
-		if p.CurrentOffset >= rangeEnd {
+		if p.CurrentOffset > rangeEnd {
 			p.ProxyStop()
 			logrus.Debugf("所有服务已经完成大小: %+v", totalLength)
 			buffer = nil
@@ -164,6 +182,8 @@ func (p *ProxyDownloadStruct) ProxyRead() []byte {
 	// 获取当前的chunk的数据
 	var currentChunk *Chunk
 	select {
+	case <-p.Ctx.Done():
+		return nil
 	case currentChunk = <-p.ReadyChunkQueue:
 		break
 	case <-time.After(time.Duration(p.ProxyTimeout) * time.Second):
@@ -172,32 +192,37 @@ func (p *ProxyDownloadStruct) ProxyRead() []byte {
 		return nil
 	}
 
-	for {
-		if !p.ProxyRunning {
-			break
-		}
-		buffer := currentChunk.get()
-		if len(buffer) > 0 {
-			p.CurrentOffset += int64(len(buffer))
-			currentChunk = nil
-			return buffer
-		} else {
-			time.Sleep(50 * time.Millisecond)
-		}
+	if !p.ProxyRunning {
+		return nil
 	}
-	currentChunk = nil
-	return nil
+	
+	buffer := currentChunk.get(p.Ctx)
+	// 如果获取到 nil，说明该 chunk 下载失败（例如 416），停止代理并返回 nil
+	if buffer == nil {
+		logrus.Debugf("ProxyRead 接收到 nil buffer (可能因为 416 或其他错误)，停止并返回")
+		p.ProxyStop()
+		return nil
+	}
+	
+	if len(buffer) == 0 {
+		logrus.Debugf("ProxyRead 接收到空 buffer (len=0)")
+		p.ProxyStop()
+		return nil
+	}
+
+	p.CurrentOffset += int64(len(buffer))
+	return buffer
 }
 
 func (p *ProxyDownloadStruct) ProxyStop() {
 	p.ProxyRunning = false
-	var currentChunk *Chunk
+	if p.Cancel != nil {
+		p.Cancel()
+	}
 	for {
 		select {
-		case currentChunk = <-p.ReadyChunkQueue:
-			currentChunk.buffer = nil
-			currentChunk = nil
-		case <-time.After(1 * time.Second):
+		case <-p.ReadyChunkQueue:
+		default:
 			return
 		}
 	}
@@ -210,18 +235,27 @@ func (p *ProxyDownloadStruct) ProxyWorker(req *http.Request) {
 		}
 
 		p.ProxyMutex.Lock()
+		if len(p.ReadyChunkQueue) >= int(p.MaxBufferedChunk) {
+			p.ProxyMutex.Unlock()
+			select {
+			case <-p.Ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+			continue
+		}
+
 		// 生成下一个chunk
 		var chunk *Chunk
 		chunk = nil
 		startOffset := p.NextChunkStartOffset
-		p.NextChunkStartOffset += p.ChunkSize
 		if startOffset <= p.EndOffset {
+			p.NextChunkStartOffset += p.ChunkSize
 			endOffset := startOffset + p.ChunkSize - 1
 			if endOffset > p.EndOffset {
 				endOffset = p.EndOffset
 			}
 			chunk = newChunk(startOffset, endOffset)
-
 			p.ReadyChunkQueue <- chunk
 		}
 		p.ProxyMutex.Unlock()
@@ -229,23 +263,6 @@ func (p *ProxyDownloadStruct) ProxyWorker(req *http.Request) {
 		// 所有chunk已下载完
 		if chunk == nil {
 			break
-		}
-
-		for {
-			if !p.ProxyRunning {
-				break
-			} else {
-				// 过多的数据未被取走，先休息一下，避免内存溢出
-				remainingSize := p.GetRemainingSize(p.ChunkSize)
-				maxBufferSize := p.ChunkSize * p.MaxBufferedChunk
-				if remainingSize >= maxBufferSize {
-					logrus.Debugf("未读取数据: %d >= 缓冲区: %d ，先休息一下，避免内存溢出", remainingSize, maxBufferSize)
-					time.Sleep(1 * time.Second)
-				} else {
-					logrus.Debugf("未读取数据: %d < 缓冲区: %d , 下载继续", remainingSize, maxBufferSize)
-					break
-				}
-			}
 		}
 
 		for {
@@ -263,7 +280,7 @@ func (p *ProxyDownloadStruct) ProxyWorker(req *http.Request) {
 
 				maxRetries := 5
 				if startOffset < int64(1048576) || (p.EndOffset-startOffset)/p.EndOffset*1000 < 2 {
-					maxRetries = 7
+					maxRetries = 10 // 增加重试次数
 				}
 
 				var resp *resty.Response
@@ -274,36 +291,73 @@ func (p *ProxyDownloadStruct) ProxyWorker(req *http.Request) {
 						SetRetryCount(1).
 						SetCookieJar(p.CookieJar).
 						R().
+						SetContext(p.Ctx).
 						SetHeaderMultiValues(newHeader).
 						SetHeader("Range", rangeStr).
 						Get(p.DownloadUrl)
 
 					if err != nil {
+						// 检查是否是被取消的上下文
+						if errors.Is(err, context.Canceled) {
+							logrus.Debugf("任务被取消: range=%d-%d", chunk.startOffset, chunk.endOffset)
+							resp = nil
+							return
+						}
 						logrus.Errorf("处理 %+v 链接 range=%d-%d 部分失败: %+v", p.DownloadUrl, chunk.startOffset, chunk.endOffset, err)
-						time.Sleep(1 * time.Second)
+						select {
+						case <-p.Ctx.Done():
+							return
+						case <-time.After(1 * time.Second):
+						}
 						resp = nil
 						continue
 					}
 					if !strings.HasPrefix(resp.Status(), "20") {
+						if resp.StatusCode() == 503 || resp.StatusCode() == 429 {
+							// 迅雷等网盘限制并发或请求过快，进行退避重试
+							logrus.Debugf("触发服务器限制(statusCode: %d)，等待重试... range=%d-%d", resp.StatusCode(), chunk.startOffset, chunk.endOffset)
+							select {
+							case <-p.Ctx.Done():
+								logrus.Debugf("任务被取消(退避期间): range=%d-%d", chunk.startOffset, chunk.endOffset)
+								return
+							case <-time.After(time.Duration(2+retry) * time.Second):
+							} // 递增等待时间
+							resp = nil
+							continue
+						}
+						if resp.StatusCode() == 416 {
+							logrus.Debugf("处理 %+v 链接 range=%d-%d 到达文件末尾 (416)", p.DownloadUrl, chunk.startOffset, chunk.endOffset)
+							resp = nil
+							break // 跳出重试循环，标记此 chunk 为结束
+						}
+						
 						logrus.Debugf("处理 %+v 链接 range=%d-%d 部分失败, statusCode: %+v: %s", p.DownloadUrl, chunk.startOffset, chunk.endOffset, resp.StatusCode(), resp.String())
 						resp = nil
-						p.ProxyStop()
-						return
+						break // 跳出重试循环，标记此 chunk 失败
 					}
 					break
 				}
 
 				if err != nil {
+					logrus.Errorf("处理链接 range=%d-%d 最终失败: %+v", chunk.startOffset, chunk.endOffset, err)
 					resp = nil
-					p.ProxyStop()
-					return
 				}
 
 				// 接收数据
-				if resp != nil && resp.Body() != nil {
-					buffer := make([]byte, chunk.endOffset-chunk.startOffset+1)
-					copy(buffer, resp.Body())
-					chunk.put(buffer)
+				if resp != nil {
+					chunk.put(resp.Body())
+				} else {
+					logrus.Debugf("Chunk range=%d-%d 无法获取数据，写入 nil 并停止调度新任务", chunk.startOffset, chunk.endOffset)
+					chunk.put(nil) // 放入 nil 标记此 chunk 失败或结束
+					
+					// 停止调度新的 chunk
+					p.ProxyMutex.Lock()
+					if p.NextChunkStartOffset <= p.EndOffset {
+						p.NextChunkStartOffset = p.EndOffset + 1
+					}
+					p.ProxyMutex.Unlock()
+					
+					return // 直接结束当前 worker 协程
 				}
 				resp = nil
 				break
@@ -312,11 +366,7 @@ func (p *ProxyDownloadStruct) ProxyWorker(req *http.Request) {
 	}
 }
 
-func (p *ProxyDownloadStruct) GetRemainingSize(bufferSize int64) int64 {
-	p.ProxyMutex.Lock()
-	defer p.ProxyMutex.Unlock()
-	return int64(len(p.ReadyChunkQueue)) * bufferSize
-}
+
 
 func handleMethod(w http.ResponseWriter, req *http.Request) {
 	switch req.Method {
@@ -325,17 +375,8 @@ func handleMethod(w http.ResponseWriter, req *http.Request) {
 		logrus.Info("正在 GET 请求")
 		// 检查查询参数是否为空
 		if req.URL.RawQuery == "" {
-			// 获取嵌入的 index.html 文件
-			index, err := indexHTML.Open("static/index.html")
-			if err != nil {
-				http.Error(w, fmt.Sprintf("读取index.html错误: %v", err), http.StatusInternalServerError)
-				return
-			}
-			defer index.Close()
-
-			// 将嵌入的文件内容复制到响应中
-			io.Copy(w, index)
-
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.Write([]byte("欢迎使用drpyS专用多线程媒体代理服务，由道长于2026年开发"))
 		} else {
 			// 如果有查询参数，则返回自定义的内容
 			handleGetMethod(w, req)
@@ -351,13 +392,6 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 
 	logrus.Debugf("当前活跃的协程数量: %d", runtime.NumGoroutine())
 
-	pw := bufio.NewWriterSize(w, 128*1024)
-	defer func() {
-		if pw.Buffered() > 0 {
-			pw.Flush()
-		}
-	}()
-
 	var url string
 	query := req.URL.Query()
 	url = query.Get("url")
@@ -366,9 +400,12 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 	strAuth := query.Get("auth")
 	strThread := req.URL.Query().Get("thread")
 	strSplitSize := req.URL.Query().Get("size")
+	if strSplitSize == "" {
+		strSplitSize = req.URL.Query().Get("chunkSize")
+	}
 
 	// 验证auth参数
-	if strAuth != "" && strAuth != authKey {
+	if authKey != "" && strAuth != authKey {
 		http.Error(w, "无效的认证参数", http.StatusUnauthorized)
 		return
 	}
@@ -451,8 +488,17 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 
 	headersKey := url + "#Headers"
 	curTime := time.Now().Unix()
-	var responseHeaders interface{}
-	responseHeaders, found = mediaCache.Get(headersKey)
+	var cachedHeaders interface{}
+	cachedHeaders, found = mediaCache.Get(headersKey)
+
+	// 深拷贝 Header，避免并发修改和互相污染
+	responseHeaders := make(http.Header)
+	if found {
+		for k, v := range cachedHeaders.(http.Header) {
+			responseHeaders[k] = append([]string(nil), v...)
+		}
+	}
+
 	if !found || curTime-lastModified > 60 {
 		// 创建专用的客户端用于获取头信息，避免修改全局设置
 		headClient := base.NewRestyClient()
@@ -475,11 +521,16 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		responseHeaders = resp.Header()
-		logrus.Debugf("请求头: %+v", responseHeaders.(http.Header))
+		// 深拷贝以防止修改缓存
+		responseHeaders = make(http.Header)
+		for k, v := range resp.Header() {
+			responseHeaders[k] = append([]string(nil), v...)
+		}
+
+		logrus.Debugf("请求头: %+v", responseHeaders)
 
 		var fileName string
-		contentDisposition := strings.ToLower(responseHeaders.(http.Header).Get("Content-Disposition"))
+		contentDisposition := strings.ToLower(responseHeaders.Get("Content-Disposition"))
 		if contentDisposition != "" {
 			regCompile := regexp.MustCompile(`^.*filename=\"([^\"]+)\".*$`)
 			if regCompile.MatchString(contentDisposition) {
@@ -499,7 +550,7 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 			}
 		}
 
-		contentType := responseHeaders.(http.Header).Get("Content-Type")
+		contentType := responseHeaders.Get("Content-Type")
 		if contentType == "" {
 			if strings.HasSuffix(fileName, ".webm") {
 				contentType = "video/webm"
@@ -522,24 +573,38 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 			} else if strings.HasSuffix(fileName, ".mp4") || strings.HasSuffix(fileName, ".m4s") {
 				contentType = "video/mp4"
 			}
-			responseHeaders.(http.Header).Set("Content-Type", contentType)
+			responseHeaders.Set("Content-Type", contentType)
 		}
 
-		contentRange := responseHeaders.(http.Header).Get("Content-Range")
+		contentRange := responseHeaders.Get("Content-Range")
 		if contentRange != "" {
 			matchGroup := regexp.MustCompile(`.*/([0-9]+)`).FindStringSubmatch(contentRange)
 			contentSize, _ := strconv.ParseInt(matchGroup[1], 10, 64)
-			responseHeaders.(http.Header).Set("Content-Length", strconv.FormatInt(contentSize, 10))
+
+			responseHeaders.Set("Content-Length", strconv.FormatInt(contentSize, 10))
 		} else {
-			responseHeaders.(http.Header).Set("Content-Length", strconv.FormatInt(resp.Size(), 10))
+			responseHeaders.Set("Content-Length", strconv.FormatInt(resp.Size(), 10))
 		}
 
-		acceptRange := responseHeaders.(http.Header).Get("Accept-Ranges")
+		acceptRange := responseHeaders.Get("Accept-Ranges")
 		if contentRange == "" && acceptRange == "" {
 			// 不支持断点续传
 			remainingSize := 0
 			const maxBufferSize = 128 * 1024 * 1024 // 128MB
 			// const maxBufferSize = 1*1024 // 1KB
+
+			// 必须先写入 Header
+			for key, values := range responseHeaders {
+				if strings.EqualFold(strings.ToLower(key), "connection") || strings.EqualFold(strings.ToLower(key), "proxy-connection") {
+					continue
+				}
+				w.Header().Set(key, strings.Join(values, ","))
+			}
+			w.Header().Set("Cache-Control", "public, max-age=31536000")
+			w.Header().Del("Pragma")
+			w.Header().Del("Expires")
+			w.Header().Set("Connection", "keep-alive")
+			w.WriteHeader(statusCode)
 
 			buf := make([]byte, 1024*64) // 64KB 缓冲区
 			for {
@@ -548,7 +613,7 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 					// 写入到客户端前更新未消费的数据大小
 					remainingSize += n
 					// 写入数据到客户端
-					_, writeErr := pw.Write(buf[:n])
+					_, writeErr := w.Write(buf[:n])
 					if writeErr != nil {
 						logrus.Errorf("向客户端写入 Response 失败: %v", writeErr)
 						return
@@ -561,11 +626,17 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 					break
 				}
 			}
-			responseHeaders.(http.Header).Set("Content-Disposition", fmt.Sprintf("attachment; filename*=UTF-8''%s", fileName))
+			// 不支持断点续传的流直接结束
+			return
 
 		} else {
 			// 支持断点续传
-			mediaCache.Set(headersKey, responseHeaders, 1800*time.Second)
+			// 缓存前深拷贝一份，避免后续修改 responseHeaders 污染缓存
+			cacheHeaders := make(http.Header)
+			for k, v := range responseHeaders {
+				cacheHeaders[k] = append([]string(nil), v...)
+			}
+			mediaCache.Set(headersKey, cacheHeaders, 1800*time.Second)
 			mediaCache.Set(cacheTimeKey, curTime, 1800*time.Second)
 		}
 
@@ -577,19 +648,12 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 		}()
 	}
 
-	acceptRange := responseHeaders.(http.Header).Get("Accept-Ranges")
-	contentRange := responseHeaders.(http.Header).Get("Content-Range")
+	acceptRange := responseHeaders.Get("Accept-Ranges")
+	contentRange := responseHeaders.Get("Content-Range")
 	if contentRange == "" && acceptRange == "" {
-		// 不支持断点续传
-		for key, values := range responseHeaders.(http.Header) {
-			if strings.EqualFold(strings.ToLower(key), "connection") || strings.EqualFold(strings.ToLower(key), "proxy-connection") {
-				continue
-			}
-			w.Header().Set(key, strings.Join(values, ","))
-		}
-		w.Header().Set("Connection", "keep-alive")
-		w.WriteHeader(statusCode)
-
+		// 理论上不可达，因为不支持断点续传的请求不会被缓存
+		http.Error(w, "无法处理不支持断点续传的缓存请求", http.StatusInternalServerError)
+		return
 	} else {
 		// 支持断点续传
 		var splitSize int64
@@ -600,10 +664,10 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 		if matchGroup != nil {
 			contentSize, _ = strconv.ParseInt(matchGroup[1], 10, 64)
 		} else {
-			contentSize, _ = strconv.ParseInt(responseHeaders.(http.Header).Get("Content-Length"), 10, 64)
+			contentSize, _ = strconv.ParseInt(responseHeaders.Get("Content-Length"), 10, 64)
 		}
 
-		if rangeEnd == int64(0) {
+		if rangeEnd == int64(0) || rangeEnd >= contentSize {
 			rangeEnd = contentSize - 1
 		}
 		if rangeStart < contentSize {
@@ -626,26 +690,73 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 				if numTasks <= 0 {
 					numTasks = 1
 				}
+				// 限制最大线程数，防止被服务器封禁（尤其是迅雷等网盘）
+				if numTasks > 16 {
+					logrus.Debugf("请求线程数(%d)过大，限制为16以防止被封禁", numTasks)
+					numTasks = 16
+				}
 			}
 
 			if strSplitSize != "" {
-				splitSize, _ = strconv.ParseInt(strSplitSize, 10, 64)
+				// 处理带单位的参数，如 256K, 1M 等
+				strSplitSize = strings.ToUpper(strSplitSize)
+				if strings.HasSuffix(strSplitSize, "K") || strings.HasSuffix(strSplitSize, "KB") {
+					valStr := strings.TrimRight(strings.TrimRight(strSplitSize, "B"), "K")
+					val, _ := strconv.ParseInt(valStr, 10, 64)
+					splitSize = val * 1024
+				} else if strings.HasSuffix(strSplitSize, "M") || strings.HasSuffix(strSplitSize, "MB") {
+					valStr := strings.TrimRight(strings.TrimRight(strSplitSize, "B"), "M")
+					val, _ := strconv.ParseInt(valStr, 10, 64)
+					splitSize = val * 1024 * 1024
+				} else {
+					// 纯数字，如果是256之类的小数字，原版逻辑认为是KB，如果是1024这种，原版逻辑认为是Byte？
+					// 按照 README 里的说法，256K 是带K的。纯数字如果是迅雷等传递过来的，往往是 kb 或者 b?
+					// 之前的逻辑是 splitSize, _ = strconv.ParseInt(strSplitSize, 10, 64)
+					// 这意味着纯数字是 byte 为单位的。
+					val, _ := strconv.ParseInt(strSplitSize, 10, 64)
+					// 如果值太小，很可能单位是 KB
+					if val < 1024*10 {
+						splitSize = val * 1024
+					} else {
+						splitSize = val
+					}
+				}
+
+				// 动态调整分片大小，结合线程数限制，保障下载速度同时避免过快请求
+				if splitSize < 128*1024 {
+					// 强制分片大小最小为 128KB，避免请求过于频繁
+					splitSizeOriginal := splitSize
+					splitSize = 128 * 1024
+					logrus.Debugf("splitSize adjusted to min 128KB: original=%d", splitSizeOriginal)
+				}
 			} else {
-				splitSize = int64(128 * 1024)
+				// 如果没有传，默认 2MB (之前是128KB，太小会导致请求过于频繁)
+				splitSize = int64(2 * 1024 * 1024)
 			}
 
+			logrus.Debugf("Proxy data transfer: thread=%d, splitSize=%d", numTasks, splitSize)
+
 			// 设置正确的Range响应头
-			responseHeaders.(http.Header).Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, contentSize))
-			responseHeaders.(http.Header).Set("Content-Length", strconv.FormatInt(rangeEnd-rangeStart+1, 10))
-			responseHeaders.(http.Header).Set("Accept-Ranges", "bytes")
+			if statusCode == 206 {
+				responseHeaders.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, contentSize))
+			} else {
+				responseHeaders.Del("Content-Range")
+			}
+			responseHeaders.Set("Content-Length", strconv.FormatInt(rangeEnd-rangeStart+1, 10))
+			responseHeaders.Set("Accept-Ranges", "bytes")
 
 			// 先设置响应头，再开始数据传输
-			for key, values := range responseHeaders.(http.Header) {
+			for key, values := range responseHeaders {
 				if strings.EqualFold(strings.ToLower(key), "connection") || strings.EqualFold(strings.ToLower(key), "proxy-connection") {
 					continue
 				}
 				w.Header().Set(key, strings.Join(values, ","))
 			}
+			// 强制设置缓存头，让播放器尽可能缓存已下载的数据，实现秒切回已缓冲位置
+			w.Header().Set("Cache-Control", "public, max-age=31536000")
+			w.Header().Del("Pragma")
+			w.Header().Del("Expires")
+
 			w.Header().Set("Connection", "keep-alive")
 			w.WriteHeader(statusCode) // 206 for partial content
 
@@ -659,10 +770,17 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 				}
 			}()
 
-			go ConcurrentDownload(url, rangeStart, rangeEnd, contentSize, splitSize, numTasks, emitter, req)
-			io.Copy(pw, emitter)
+			go ConcurrentDownload(req.Context(), url, rangeStart, rangeEnd, contentSize, splitSize, numTasks, emitter, req)
+
+			// 响应数据，使用较大的 buffer 提高复制效率
+			buf := make([]byte, 128*1024)
+			_, err := io.CopyBuffer(w, emitter, buf)
+			if err != nil && !strings.Contains(err.Error(), "write on closed pipe") && !strings.Contains(err.Error(), "client disconnected") && !strings.Contains(err.Error(), "forcibly closed") && !errors.Is(err, syscall.EPIPE) && !errors.Is(err, syscall.ECONNRESET) {
+				logrus.Debugf("io.Copy error: %v", err)
+			}
 		} else {
 			// Range超出文件大小，返回416错误
+			logrus.Debugf("Range超出文件大小，返回416错误. rangeStart: %d, rangeEnd: %d, contentSize: %d", rangeStart, rangeEnd, contentSize)
 			statusCode = 416
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", contentSize))
 			w.WriteHeader(statusCode)
@@ -681,7 +799,7 @@ func handleOtherMethod(w http.ResponseWriter, req *http.Request) {
 	strAuth := query.Get("auth")
 
 	// 验证auth参数
-	if strAuth != "" && strAuth != authKey {
+	if authKey != "" && strAuth != authKey {
 		http.Error(w, "无效的认证参数", http.StatusUnauthorized)
 		return
 	}
@@ -833,9 +951,9 @@ func shouldFilterHeaderName(key string) bool {
 func main() {
 	// 定义 dns 和 debug 命令行参数
 	dns := flag.String("dns", "8.8.8.8", "DNS解析 IP:port")
-	port := flag.String("port", "57574", "服务器端口")
+	port := flag.String("port", "5575", "服务器端口")
 	debug := flag.Bool("debug", false, "Debug模式")
-	auth := flag.String("auth", "drpys", "认证密钥")
+	auth := flag.String("auth", "", "认证密钥")
 	flag.Parse()
 
 	// 忽略 SIGPIPE 信号
