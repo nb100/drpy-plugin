@@ -1,363 +1,339 @@
-<!doctype html>
-<html>
+<!DOCTYPE html>
+<html lang="zh-CN">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0,user-scalable=no">
-<title>404</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>drpyS 媒体代理服务</title>
+    <style>
+        :root {
+            --primary-color: #4f46e5;
+            --primary-hover: #4338ca;
+            --bg-color: #f3f4f6;
+            --card-bg: #ffffff;
+            --text-main: #1f2937;
+            --text-muted: #6b7280;
+            --border-color: #e5e7eb;
+        }
 
-<style>
-html, body {
-  background: #28254C;
-  font-family: 'Ubuntu';
-}
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
 
-* {
-  box-sizing: border-box;
-}
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            line-height: 1.6;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 2rem 1rem;
+        }
 
-.box {
-  width: 350px;
-  height: 100%;
-  max-height: 600px;
-  min-height: 450px;
-  background: #332F63;
-  border-radius: 20px;
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
-  padding: 30px 50px;
-}
-.box .box__ghost {
-  padding: 15px 25px 25px;
-  position: absolute;
-  left: 50%;
-  top: 30%;
-  transform: translate(-50%, -30%);
-}
-.box .box__ghost .symbol:nth-child(1) {
-  opacity: .2;
-  animation: shine 4s ease-in-out 3s infinite;
-}
-.box .box__ghost .symbol:nth-child(1):before, .box .box__ghost .symbol:nth-child(1):after {
-  content: '';
-  width: 12px;
-  height: 4px;
-  background: #fff;
-  position: absolute;
-  border-radius: 5px;
-  bottom: 65px;
-  left: 0;
-}
-.box .box__ghost .symbol:nth-child(1):before {
-  transform: rotate(45deg);
-}
-.box .box__ghost .symbol:nth-child(1):after {
-  transform: rotate(-45deg);
-}
-.box .box__ghost .symbol:nth-child(2) {
-  position: absolute;
-  left: -5px;
-  top: 30px;
-  height: 18px;
-  width: 18px;
-  border: 4px solid;
-  border-radius: 50%;
-  border-color: #fff;
-  opacity: .2;
-  animation: shine 4s ease-in-out 1.3s infinite;
-}
-.box .box__ghost .symbol:nth-child(3) {
-  opacity: .2;
-  animation: shine 3s ease-in-out .5s infinite;
-}
-.box .box__ghost .symbol:nth-child(3):before, .box .box__ghost .symbol:nth-child(3):after {
-  content: '';
-  width: 12px;
-  height: 4px;
-  background: #fff;
-  position: absolute;
-  border-radius: 5px;
-  top: 5px;
-  left: 40px;
-}
-.box .box__ghost .symbol:nth-child(3):before {
-  transform: rotate(90deg);
-}
-.box .box__ghost .symbol:nth-child(3):after {
-  transform: rotate(180deg);
-}
-.box .box__ghost .symbol:nth-child(4) {
-  opacity: .2;
-  animation: shine 6s ease-in-out 1.6s infinite;
-}
-.box .box__ghost .symbol:nth-child(4):before, .box .box__ghost .symbol:nth-child(4):after {
-  content: '';
-  width: 15px;
-  height: 4px;
-  background: #fff;
-  position: absolute;
-  border-radius: 5px;
-  top: 10px;
-  right: 30px;
-}
-.box .box__ghost .symbol:nth-child(4):before {
-  transform: rotate(45deg);
-}
-.box .box__ghost .symbol:nth-child(4):after {
-  transform: rotate(-45deg);
-}
-.box .box__ghost .symbol:nth-child(5) {
-  position: absolute;
-  right: 5px;
-  top: 40px;
-  height: 12px;
-  width: 12px;
-  border: 3px solid;
-  border-radius: 50%;
-  border-color: #fff;
-  opacity: .2;
-  animation: shine 1.7s ease-in-out 7s infinite;
-}
-.box .box__ghost .symbol:nth-child(6) {
-  opacity: .2;
-  animation: shine 2s ease-in-out 6s infinite;
-}
-.box .box__ghost .symbol:nth-child(6):before, .box .box__ghost .symbol:nth-child(6):after {
-  content: '';
-  width: 15px;
-  height: 4px;
-  background: #fff;
-  position: absolute;
-  border-radius: 5px;
-  bottom: 65px;
-  right: -5px;
-}
-.box .box__ghost .symbol:nth-child(6):before {
-  transform: rotate(90deg);
-}
-.box .box__ghost .symbol:nth-child(6):after {
-  transform: rotate(180deg);
-}
-.box .box__ghost .box__ghost-container {
-  background: #fff;
-  width: 100px;
-  height: 100px;
-  border-radius: 100px 100px 0 0;
-  position: relative;
-  margin: 0 auto;
-  animation: upndown 3s ease-in-out infinite;
-}
-.box .box__ghost .box__ghost-container .box__ghost-eyes {
-  position: absolute;
-  left: 50%;
-  top: 45%;
-  height: 12px;
-  width: 70px;
-}
-.box .box__ghost .box__ghost-container .box__ghost-eyes .box__eye-left {
-  width: 12px;
-  height: 12px;
-  background: #332F63;
-  border-radius: 50%;
-  margin: 0 10px;
-  position: absolute;
-  left: 0;
-}
-.box .box__ghost .box__ghost-container .box__ghost-eyes .box__eye-right {
-  width: 12px;
-  height: 12px;
-  background: #332F63;
-  border-radius: 50%;
-  margin: 0 10px;
-  position: absolute;
-  right: 0;
-}
-.box .box__ghost .box__ghost-container .box__ghost-bottom {
-  display: flex;
-  position: absolute;
-  top: 100%;
-  left: 0;
-  right: 0;
-}
-.box .box__ghost .box__ghost-container .box__ghost-bottom div {
-  flex-grow: 1;
-  position: relative;
-  top: -10px;
-  height: 20px;
-  border-radius: 100%;
-  background-color: #fff;
-}
-.box .box__ghost .box__ghost-container .box__ghost-bottom div:nth-child(2n) {
-  top: -12px;
-  margin: 0 -0px;
-  border-top: 15px solid #332F63;
-  background: transparent;
-}
-.box .box__ghost .box__ghost-shadow {
-  height: 20px;
-  box-shadow: 0 50px 15px 5px #3B3769;
-  border-radius: 50%;
-  margin: 0 auto;
-  animation: smallnbig 3s ease-in-out infinite;
-}
-.box .box__description {
-  position: absolute;
-  bottom: 30px;
-  left: 50%;
-  transform: translateX(-50%);
-}
-.box .box__description .box__description-container {
-  color: #fff;
-  text-align: center;
-  width: 200px;
-  font-size: 16px;
-  margin: 0 auto;
-}
-.box .box__description .box__description-container .box__description-title {
-  font-size: 24px;
-  letter-spacing: .5px;
-}
-.box .box__description .box__description-container .box__description-text {
-  color: #8C8AA7;
-  line-height: 20px;
-  margin-top: 20px;
-}
-.box .box__description .box__button {
-  display: block;
-  position: relative;
-  background: #FF5E65;
-  border: 1px solid transparent;
-  border-radius: 50px;
-  height: 50px;
-  text-align: center;
-  text-decoration: none;
-  color: #fff;
-  line-height: 50px;
-  font-size: 18px;
-  padding: 0 70px;
-  white-space: nowrap;
-  margin-top: 25px;
-  transition: background .5s ease;
-  overflow: hidden;
-}
-.box .box__description .box__button:before {
-  content: '';
-  position: absolute;
-  width: 20px;
-  height: 100px;
-  background: #fff;
-  bottom: -25px;
-  left: 0;
-  border: 2px solid #fff;
-  transform: translateX(-50px) rotate(45deg);
-  transition: transform .5s ease;
-}
-.box .box__description .box__button:hover {
-  background: transparent;
-  border-color: #fff;
-}
-.box .box__description .box__button:hover:before {
-  transform: translateX(250px) rotate(45deg);
-}
+        .container {
+            width: 100%;
+            max-width: 800px;
+            background: var(--card-bg);
+            border-radius: 1rem;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            padding: 2rem;
+            margin-top: 2vh;
+        }
 
-@keyframes upndown {
-  0% {
-    transform: translateY(5px);
-  }
-  50% {
-    transform: translateY(15px);
-  }
-  100% {
-    transform: translateY(5px);
-  }
-}
-@keyframes smallnbig {
-  0% {
-    width: 90px;
-  }
-  50% {
-    width: 100px;
-  }
-  100% {
-    width: 90px;
-  }
-}
-@keyframes shine {
-  0% {
-    opacity: .2;
-  }
-  25% {
-    opacity: .1;
-  }
-  50% {
-    opacity: .2;
-  }
-  100% {
-    opacity: .2;
-  }
-}
-</style>
+        header {
+            text-align: center;
+            margin-bottom: 2rem;
+            padding-bottom: 1.5rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        h1 {
+            font-size: 1.875rem;
+            font-weight: 700;
+            color: var(--primary-color);
+            margin-bottom: 0.5rem;
+        }
+
+        .subtitle {
+            color: var(--text-muted);
+            font-size: 1.1rem;
+        }
+
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+
+        label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+            color: var(--text-main);
+        }
+
+        input[type="text"], 
+        input[type="number"], 
+        textarea {
+            width: 100%;
+            padding: 0.75rem;
+            border: 1px solid var(--border-color);
+            border-radius: 0.5rem;
+            font-size: 1rem;
+            transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
+        }
+
+        input[type="text"]:focus, 
+        input[type="number"]:focus, 
+        textarea:focus {
+            outline: none;
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.2);
+        }
+
+        .row {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .col {
+            flex: 1;
+        }
+
+        button {
+            background-color: var(--primary-color);
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            font-size: 1.1rem;
+            font-weight: 600;
+            border-radius: 0.5rem;
+            cursor: pointer;
+            width: 100%;
+            transition: background-color 0.15s ease-in-out;
+        }
+
+        button:hover {
+            background-color: var(--primary-hover);
+        }
+
+        .result-box {
+            margin-top: 2rem;
+            padding: 1.5rem;
+            background-color: #f8fafc;
+            border: 1px solid var(--border-color);
+            border-radius: 0.5rem;
+            display: none;
+        }
+
+        .result-box.active {
+            display: block;
+            animation: fadeIn 0.3s ease-in-out;
+        }
+
+        .result-url {
+            word-break: break-all;
+            font-family: monospace;
+            background: #e0e7ff;
+            padding: 1rem;
+            border-radius: 0.375rem;
+            color: #3730a3;
+            margin-bottom: 1rem;
+            border: 1px solid #c7d2fe;
+        }
+
+        .copy-btn {
+            background-color: #10b981;
+            width: auto;
+        }
+
+        .copy-btn:hover {
+            background-color: #059669;
+        }
+
+        .help-section {
+            margin-top: 3rem;
+            padding-top: 2rem;
+            border-top: 1px solid var(--border-color);
+        }
+
+        .help-section h2 {
+            font-size: 1.5rem;
+            margin-bottom: 1rem;
+        }
+
+        .help-list {
+            list-style-type: none;
+        }
+
+        .help-list li {
+            margin-bottom: 0.75rem;
+            padding-left: 1.5rem;
+            position: relative;
+        }
+
+        .help-list li::before {
+            content: "•";
+            color: var(--primary-color);
+            font-weight: bold;
+            position: absolute;
+            left: 0;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(-10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @media (max-width: 640px) {
+            .row {
+                flex-direction: column;
+                gap: 0;
+            }
+            .container {
+                padding: 1.5rem;
+            }
+        }
+    </style>
 </head>
 <body>
-<div class="box">
-  <div class="box__ghost">
-    <div class="symbol"></div>
-    <div class="symbol"></div>
-    <div class="symbol"></div>
-    <div class="symbol"></div>
-    <div class="symbol"></div>
-    <div class="symbol"></div>
-    
-    <div class="box__ghost-container">
-      <div class="box__ghost-eyes">
-        <div class="box__eye-left"></div>
-        <div class="box__eye-right"></div>
-      </div>
-      <div class="box__ghost-bottom">
-        <div></div>
-        <div></div>
-        <div></div>
-        <div></div>
-        <div></div>
-      </div>
+
+    <div class="container">
+        <header>
+            <h1>drpyS 多线程媒体代理服务</h1>
+            <p class="subtitle">欢迎使用，由道长于 2026 年开发</p>
+        </header>
+
+        <div class="form-group">
+            <label for="url">目标视频直链 (URL) *</label>
+            <textarea id="url" rows="3" placeholder="例如: https://example.com/video.mp4" required></textarea>
+        </div>
+
+        <div class="row">
+            <div class="col form-group">
+                <label for="thread">线程数 (thread)</label>
+                <input type="number" id="thread" placeholder="留空自动分配, 默认 1" min="1" max="32">
+            </div>
+            <div class="col form-group">
+                <label for="chunkSize">分片大小 (size/chunkSize)</label>
+                <input type="text" id="chunkSize" placeholder="例如: 256K, 1M (默认 128K)">
+            </div>
+        </div>
+
+        <div class="row">
+            <div class="col form-group">
+                <label for="auth">认证密钥 (auth)</label>
+                <input type="text" id="auth" placeholder="如果服务端设置了 auth，则必须填写">
+            </div>
+            <div class="col form-group">
+                <label for="form">数据格式 (form)</label>
+                <select id="form" style="width: 100%; padding: 0.75rem; border: 1px solid var(--border-color); border-radius: 0.5rem; font-size: 1rem; background: white;">
+                    <option value="">普通文本 (默认)</option>
+                    <option value="base64">Base64编码</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label for="headers">自定义请求头 (headers) [JSON 格式]</label>
+            <textarea id="headers" rows="2" placeholder='例如: {"User-Agent": "Mozilla/5.0", "Referer": "https://..."}'></textarea>
+        </div>
+
+        <button id="generateBtn">生成代理地址</button>
+
+        <div class="result-box" id="resultBox">
+            <label>生成的代理链接：</label>
+            <div class="result-url" id="resultUrl"></div>
+            <button class="copy-btn" id="copyBtn">复制链接</button>
+        </div>
+
+        <div class="help-section">
+            <h2>使用帮助</h2>
+            <ul class="help-list">
+                <li><strong>目标视频直链：</strong> 必须提供。即你想要通过代理加速播放的原始视频地址。</li>
+                <li><strong>线程数 (thread)：</strong> 代理拉取视频时使用的并发连接数。留空则根据文件大小自动分配（最大限制32）。</li>
+                <li><strong>分片大小 (size)：</strong> 每个线程每次请求的数据块大小。支持单位 K、M，或纯数字(默认K)。限制范围：32KB ~ 10MB。</li>
+                <li><strong>认证密钥 (auth)：</strong> 如果代理服务端启动时加了 <code>-auth</code> 参数，则必须在此填写对应的密钥。</li>
+                <li><strong>数据格式 (form)：</strong> 可选 <code>base64</code>，用于将 URL 和 Headers 进行 Base64 编码，防止特殊字符导致解析错误。</li>
+                <li><strong>自定义请求头 (headers)：</strong> 某些防盗链视频需要提供特定的 User-Agent 或 Referer，请使用 JSON 格式填入。</li>
+                <li><strong>兼容性：</strong> 本代理对 ExoPlayer、IjkPlayer、MPV 进行了深度优化，支持完美拖拽与秒播。</li>
+            </ul>
+        </div>
     </div>
-    <div class="box__ghost-shadow"></div>
-  </div>
-  
-  <div class="box__description">
-    <div class="box__description-container">
-      <div class="box__description-title">404错误！</div>
-      <div class="box__description-text">404错误！</div>
-    </div>
-    
-    <a href="#" class="box__button">返回</a>
-    
-  </div>
-  
-</div>
 
-<script>
-//based on https://dribbble.com/shots/3913847-404-page
+    <script>
+        document.getElementById('generateBtn').addEventListener('click', function() {
+            let url = document.getElementById('url').value.trim();
+            const thread = document.getElementById('thread').value.trim();
+            const chunkSize = document.getElementById('chunkSize').value.trim();
+            const auth = document.getElementById('auth').value.trim();
+            const form = document.getElementById('form').value;
+            let headers = document.getElementById('headers').value.trim();
 
-var pageX = $(document).width();
-var pageY = $(document).height();
-var mouseY=0;
-var mouseX=0;
+            if (!url) {
+                alert('请输入目标视频直链！');
+                return;
+            }
 
-$(document).mousemove(function( event ) {
-  //verticalAxis
-  mouseY = event.pageY;
-  yAxis = (pageY/2-mouseY)/pageY*300; 
-  //horizontalAxis
-  mouseX = event.pageX / -pageX;
-  xAxis = -mouseX * 100 - 100;
+            // 获取当前域名和端口
+            const baseUrl = window.location.protocol + '//' + window.location.host + '/proxy?';
+            const params = new URLSearchParams();
+            
+            if (form === 'base64') {
+                params.append('form', 'base64');
+                url = btoa(unescape(encodeURIComponent(url)));
+            }
+            params.append('url', url);
+            
+            if (thread) {
+                params.append('thread', thread);
+            }
+            if (chunkSize) {
+                params.append('size', chunkSize);
+            }
+            if (auth) {
+                params.append('auth', auth);
+            }
+            if (headers) {
+                try {
+                    // 验证是否是合法的 JSON
+                    JSON.parse(headers);
+                    if (form === 'base64') {
+                        headers = btoa(unescape(encodeURIComponent(headers)));
+                    }
+                    params.append('headers', headers);
+                } catch (e) {
+                    alert('自定义请求头格式错误，必须是合法的 JSON 格式！');
+                    return;
+                }
+            }
 
-  $('.box__ghost-eyes').css({ 'transform': 'translate('+ xAxis +'%,-'+ yAxis +'%)' }); 
+            const finalUrl = baseUrl + params.toString();
+            
+            const resultBox = document.getElementById('resultBox');
+            const resultUrl = document.getElementById('resultUrl');
+            
+            resultUrl.textContent = finalUrl;
+            resultBox.classList.add('active');
+        });
 
-  //console.log('X: ' + xAxis);
-
-});</script>
-
+        document.getElementById('copyBtn').addEventListener('click', function() {
+            const textToCopy = document.getElementById('resultUrl').textContent;
+            navigator.clipboard.writeText(textToCopy).then(function() {
+                const btn = document.getElementById('copyBtn');
+                const originalText = btn.textContent;
+                btn.textContent = '已复制！';
+                btn.style.backgroundColor = '#047857';
+                setTimeout(() => {
+                    btn.textContent = originalText;
+                    btn.style.backgroundColor = '';
+                }, 2000);
+            }).catch(function(err) {
+                alert('复制失败，请手动复制');
+            });
+        });
+    </script>
 </body>
 </html>

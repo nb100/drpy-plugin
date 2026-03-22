@@ -39,6 +39,11 @@ var indexHTML embed.FS
 
 var mediaCache = cache.New(4*time.Hour, 10*time.Minute)
 var authKey string
+var enableContentTypeGuess bool
+
+const (
+	AppVersion = "V1.0.1 20260322"
+)
 
 type Chunk struct {
 	startOffset int64
@@ -301,6 +306,7 @@ func (p *ProxyDownloadStruct) ProxyWorker(req *http.Request) {
 
 				var resp *resty.Response
 				var err error
+				var finalBody []byte
 				for retry := 0; retry < maxRetries; retry++ {
 					resp, err = base.RestyClient.
 						SetTimeout(30*time.Second).
@@ -351,22 +357,67 @@ func (p *ProxyDownloadStruct) ProxyWorker(req *http.Request) {
 						resp = nil
 						break // 跳出重试循环，标记此 chunk 失败
 					}
+
+					// 检查数据长度
+					body := resp.Body()
+					expectedLen := int(chunk.endOffset - chunk.startOffset + 1)
+
+					if resp.StatusCode() == 200 && chunk.startOffset > 0 {
+						logrus.Warnf("【警告】请求部分数据 range=%d-%d 但服务器返回 200 OK (全量数据), 丢弃并重试", chunk.startOffset, chunk.endOffset)
+						err = fmt.Errorf("server returned 200 instead of 206")
+						resp = nil
+						select {
+						case <-p.Ctx.Done():
+							return
+						case <-time.After(2 * time.Second):
+						}
+						continue
+					}
+
+					// 严格校验 Content-Range 偏移量，防止 CDN 返回错误的分片数据导致播放器解码卡死
+					respContentRange := resp.Header().Get("Content-Range")
+					if respContentRange != "" && resp.StatusCode() == 206 {
+						expectedPrefix := fmt.Sprintf("bytes %d-", chunk.startOffset)
+						if !strings.HasPrefix(respContentRange, expectedPrefix) {
+							logrus.Warnf("【致命警告】CDN返回的Range偏移量错误! 期望: %s, 实际: %s. 丢弃并重试以防止播放器画面卡死", expectedPrefix, respContentRange)
+							err = fmt.Errorf("invalid content-range: %s", respContentRange)
+							resp = nil
+							select {
+							case <-p.Ctx.Done():
+								return
+							case <-time.After(1 * time.Second):
+							}
+							continue
+						}
+					}
+
+					if len(body) < expectedLen {
+						logrus.Warnf("【警告】收到数据长度不足! 请求 range=%d-%d (预期 %d), 实际收到 %d bytes, 丢弃并重试", chunk.startOffset, chunk.endOffset, expectedLen, len(body))
+						err = fmt.Errorf("short read: %d < %d", len(body), expectedLen)
+						resp = nil
+						select {
+						case <-p.Ctx.Done():
+							return
+						case <-time.After(1 * time.Second):
+						}
+						continue
+					} else if len(body) > expectedLen {
+						logrus.Debugf("收到数据长度超长 (预期 %d, 实际 %d), 进行截断", expectedLen, len(body))
+						finalBody = body[:expectedLen]
+					} else {
+						finalBody = body
+					}
+
 					break
 				}
 
-				if err != nil {
+				if err != nil && resp == nil && finalBody == nil {
 					logrus.Errorf("处理链接 range=%d-%d 最终失败: %+v", chunk.startOffset, chunk.endOffset, err)
-					resp = nil
 				}
 
 				// 接收数据
-				if resp != nil {
-					body := resp.Body()
-					expectedLen := int(chunk.endOffset - chunk.startOffset + 1)
-					if len(body) != expectedLen {
-						logrus.Warnf("【警告】收到数据长度不匹配! 请求 range=%d-%d (预期 %d), 实际收到 %d bytes, Content-Range: %s", chunk.startOffset, chunk.endOffset, expectedLen, len(body), resp.Header().Get("Content-Range"))
-					}
-					chunk.put(body)
+				if finalBody != nil {
+					chunk.put(finalBody)
 				} else {
 					logrus.Debugf("Chunk range=%d-%d 无法获取数据，写入 nil 并停止调度新任务", chunk.startOffset, chunk.endOffset)
 					chunk.put(nil) // 放入 nil 标记此 chunk 失败或结束
@@ -387,6 +438,54 @@ func (p *ProxyDownloadStruct) ProxyWorker(req *http.Request) {
 	}
 }
 
+func guessContentType(url string, contentDisposition string) string {
+	var fileName string
+	contentDisposition = strings.ToLower(contentDisposition)
+	if contentDisposition != "" {
+		regCompile := regexp.MustCompile(`^.*filename=\"([^\"]+)\".*$`)
+		if regCompile.MatchString(contentDisposition) {
+			fileName = regCompile.ReplaceAllString(contentDisposition, "$1")
+		}
+	} else {
+		// 找到最后一个 "/" 的索引
+		lastSlashIndex := strings.LastIndex(url, "/")
+		// 找到第一个 "?" 的索引
+		queryIndex := strings.Index(url, "?")
+		if queryIndex == -1 {
+			// 如果没有 "?"，则提取从最后一个 "/" 到结尾的字符串
+			fileName = url[lastSlashIndex+1:]
+		} else {
+			// 如果存在 "?"，则提取从最后一个 "/" 到 "?" 之间的字符串
+			fileName = url[lastSlashIndex+1 : queryIndex]
+		}
+	}
+
+	contentType := ""
+	urlLower := strings.ToLower(url)
+	if strings.HasSuffix(fileName, ".webm") || strings.Contains(urlLower, "fext=webm") || strings.Contains(urlLower, ".webm") {
+		contentType = "video/webm"
+	} else if strings.HasSuffix(fileName, ".avi") || strings.Contains(urlLower, "fext=avi") || strings.Contains(urlLower, ".avi") {
+		contentType = "video/x-msvideo"
+	} else if strings.HasSuffix(fileName, ".wmv") || strings.Contains(urlLower, "fext=wmv") || strings.Contains(urlLower, ".wmv") {
+		contentType = "video/x-ms-wmv"
+	} else if strings.HasSuffix(fileName, ".flv") || strings.Contains(urlLower, "fext=flv") || strings.Contains(urlLower, ".flv") {
+		contentType = "video/x-flv"
+	} else if strings.HasSuffix(fileName, ".mov") || strings.Contains(urlLower, "fext=mov") || strings.Contains(urlLower, ".mov") {
+		contentType = "video/quicktime"
+	} else if strings.HasSuffix(fileName, ".mkv") || strings.Contains(urlLower, "fext=mkv") || strings.Contains(urlLower, ".mkv") {
+		contentType = "video/x-matroska"
+	} else if strings.HasSuffix(fileName, ".ts") || strings.Contains(urlLower, "fext=ts") || strings.Contains(urlLower, ".ts") {
+		contentType = "video/mp2t"
+	} else if strings.HasSuffix(fileName, ".mpeg") || strings.HasSuffix(fileName, ".mpg") {
+		contentType = "video/mpeg"
+	} else if strings.HasSuffix(fileName, ".3gpp") || strings.HasSuffix(fileName, ".3gp") {
+		contentType = "video/3gpp"
+	} else if strings.HasSuffix(fileName, ".mp4") || strings.HasSuffix(fileName, ".m4s") || strings.Contains(urlLower, "fext=mp4") || strings.Contains(urlLower, ".mp4") {
+		contentType = "video/mp4"
+	}
+	return contentType
+}
+
 func handleMethod(w http.ResponseWriter, req *http.Request) {
 	switch req.Method {
 	case http.MethodGet, http.MethodHead:
@@ -394,9 +493,15 @@ func handleMethod(w http.ResponseWriter, req *http.Request) {
 		logrus.Info("正在 GET/HEAD 请求")
 		// 检查查询参数是否为空
 		if req.URL.RawQuery == "" {
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			if req.Method == http.MethodGet {
-				w.Write([]byte("欢迎使用drpyS专用多线程媒体代理服务，由道长于2026年开发"))
+				indexContent, err := indexHTML.ReadFile("static/index.html")
+				if err == nil {
+					w.Header().Set("Content-Type", "text/html; charset=utf-8")
+					w.Write(indexContent)
+				} else {
+					w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+					w.Write([]byte(fmt.Sprintf("欢迎使用drpyS专用多线程媒体代理服务，由道长于2026年开发\n版本: %s", AppVersion)))
+				}
 			}
 		} else {
 			// 如果有查询参数，则返回自定义的内容
@@ -583,64 +688,19 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 
 		logrus.Debugf("请求头: %+v", responseHeaders)
 
-		var fileName string
-		contentDisposition := strings.ToLower(responseHeaders.Get("Content-Disposition"))
-		if contentDisposition != "" {
-			regCompile := regexp.MustCompile(`^.*filename=\"([^\"]+)\".*$`)
-			if regCompile.MatchString(contentDisposition) {
-				fileName = regCompile.ReplaceAllString(contentDisposition, "$1")
-			}
-		} else {
-			// 找到最后一个 "/" 的索引
-			lastSlashIndex := strings.LastIndex(url, "/")
-			// 找到第一个 "?" 的索引
-			queryIndex := strings.Index(url, "?")
-			if queryIndex == -1 {
-				// 如果没有 "?"，则提取从最后一个 "/" 到结尾的字符串
-				fileName = url[lastSlashIndex+1:]
-			} else {
-				// 如果存在 "?"，则提取从最后一个 "/" 到 "?" 之间的字符串
-				fileName = url[lastSlashIndex+1 : queryIndex]
-			}
-		}
-
 		contentType := responseHeaders.Get("Content-Type")
 		if contentType == "" || contentType == "application/octet-stream" {
-			urlLower := strings.ToLower(url)
-			if strings.HasSuffix(fileName, ".webm") || strings.Contains(urlLower, "fext=webm") || strings.Contains(urlLower, ".webm") {
-				contentType = "video/webm"
-			} else if strings.HasSuffix(fileName, ".avi") || strings.Contains(urlLower, "fext=avi") || strings.Contains(urlLower, ".avi") {
-				contentType = "video/x-msvideo"
-			} else if strings.HasSuffix(fileName, ".wmv") || strings.Contains(urlLower, "fext=wmv") || strings.Contains(urlLower, ".wmv") {
-				contentType = "video/x-ms-wmv"
-			} else if strings.HasSuffix(fileName, ".flv") || strings.Contains(urlLower, "fext=flv") || strings.Contains(urlLower, ".flv") {
-				contentType = "video/x-flv"
-			} else if strings.HasSuffix(fileName, ".mov") || strings.Contains(urlLower, "fext=mov") || strings.Contains(urlLower, ".mov") {
-				contentType = "video/quicktime"
-			} else if strings.HasSuffix(fileName, ".mkv") || strings.Contains(urlLower, "fext=mkv") || strings.Contains(urlLower, ".mkv") {
-				contentType = "video/x-matroska"
-			} else if strings.HasSuffix(fileName, ".ts") || strings.Contains(urlLower, "fext=ts") || strings.Contains(urlLower, ".ts") {
-				contentType = "video/mp2t"
-			} else if strings.HasSuffix(fileName, ".mpeg") || strings.HasSuffix(fileName, ".mpg") {
-				contentType = "video/mpeg"
-			} else if strings.HasSuffix(fileName, ".3gpp") || strings.HasSuffix(fileName, ".3gp") {
-				contentType = "video/3gpp"
-			} else if strings.HasSuffix(fileName, ".mp4") || strings.HasSuffix(fileName, ".m4s") || strings.Contains(urlLower, "fext=mp4") || strings.Contains(urlLower, ".mp4") {
-				contentType = "video/mp4"
+			if enableContentTypeGuess {
+				guessedType := guessContentType(url, responseHeaders.Get("Content-Disposition"))
+				if guessedType != "" {
+					responseHeaders.Set("Content-Type", guessedType)
+				} else {
+					responseHeaders.Del("Content-Type")
+				}
 			} else {
-				// ExoPlayer 如果没有明确类型且为 octet-stream 会报错。
-				// IjkPlayer 在碰到明确错误格式时可能会播放失败。
-				// MPV 等严格的播放器如果遇到强制篡改的 video/mp4 但实际是 mkv 可能会解码失败。
-				// 我们需要做的是：
-				// 1. 尝试从网盘的响应头中原样透传。
-				// 2. 如果实在没有，我们就不设置它，让播放器自己嗅探 (不要强制设为 video/mp4)
-			}
-
-			if contentType != "" {
-				responseHeaders.Set("Content-Type", contentType)
-			} else {
-				// 如果实在没有识别出类型，为了最大兼容性，最好删除该头，让 mpv/ijk 等播放器自己根据内容嗅探
-				// 不要给默认的 application/octet-stream，这会让 mpv 困惑
+				// 默认不启用：不要强行根据 URL 猜测 Content-Type，因为网盘的 fext=mp4 可能是假的（实际上是 mkv 等）。
+				// 强行设置为 video/mp4 会导致 MPV/ffmpeg 强制使用 mp4 解码器，从而在拖拽时因为索引不匹配而卡死！
+				// 删除 Content-Type 让所有播放器（Exo/Ijk/MPV）强制进行真实的二进制嗅探 (Sniffing)。
 				responseHeaders.Del("Content-Type")
 			}
 		}
@@ -771,7 +831,7 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 			}
 			rangeEnd = contentSize - 1
 		} else {
-			if !isExactRange && (rangeEnd == -1 || rangeEnd >= contentSize) {
+			if rangeEnd == -1 || rangeEnd >= contentSize {
 				rangeEnd = contentSize - 1
 			}
 			if rangeStart < 0 {
@@ -1086,12 +1146,39 @@ func shouldFilterHeaderName(key string) bool {
 }
 
 func main() {
-	// 定义 dns 和 debug 命令行参数
+	// 定义命令行参数
 	dns := flag.String("dns", "8.8.8.8", "DNS解析 IP:port")
 	port := flag.String("port", "5575", "服务器端口")
 	debug := flag.Bool("debug", false, "Debug模式")
 	auth := flag.String("auth", "", "认证密钥")
+	guessType := flag.Bool("guess-type", false, "是否根据URL强制猜测并设置 Content-Type (可能导致 MPV 等播放器拖拽失败，默认不启用)")
+
+	// 帮助和版本信息
+	showHelp := flag.Bool("h", false, "显示帮助信息")
+	showHelpLong := flag.Bool("help", false, "显示帮助信息")
+	showVersion := flag.Bool("v", false, "显示版本信息")
+	showVersionLong := flag.Bool("version", false, "显示版本信息")
+
+	// 自定义 Usage
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "drpyS专用多线程媒体代理服务 %s\n\n", AppVersion)
+		fmt.Fprintf(os.Stderr, "用法:\n")
+		fmt.Fprintf(os.Stderr, "  %s [参数]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "参数列表:\n")
+		flag.PrintDefaults()
+	}
+
 	flag.Parse()
+
+	if *showHelp || *showHelpLong {
+		flag.Usage()
+		return
+	}
+
+	if *showVersion || *showVersionLong {
+		fmt.Printf("drpyS专用多线程媒体代理服务 %s\n", AppVersion)
+		return
+	}
 
 	// 忽略 SIGPIPE 信号
 	signal.Ignore(syscall.SIGPIPE)
@@ -1106,11 +1193,9 @@ func main() {
 	}
 	logrus.Infof("服务器运行在 %s 端口.", *port)
 
-	// 开启Debug
-	//logrus.SetLevel(logrus.DebugLevel)
-
 	// 设置全局变量
 	authKey = *auth
+	enableContentTypeGuess = *guessType
 	base.DnsResolverIP = *dns
 	base.InitClient()
 	var server = http.Server{
