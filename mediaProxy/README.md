@@ -167,8 +167,11 @@ curl "http://localhost:57574/?form=base64&url=$URL_B64&headers=$HEADER_B64&auth=
 
 ### 5. 自定义分片大小
 ```bash
-# 设置每个分片为256KB
+# 设置每个分片为256KB（带单位）
 curl "http://localhost:57574/?url=https://example.com/file.zip&size=256K&auth=drpys"
+
+# 设置每个分片为512KB（纯数字默认单位为KB）
+curl "http://localhost:57574/?url=https://example.com/file.zip&size=512&auth=drpys"
 ```
 
 ## 项目架构
@@ -232,10 +235,10 @@ headers和url可进行base64编码，以避免sni阻断
   </thead>
   <tbody>
     <tr>
-      <td style="text-align:center;">size</td>
+      <td style="text-align:center;">size/chunkSize</td>
       <td style="text-align:center;">可选</td>
-      <td style="text-align:center;">单线程下载数据大小，可动态调节</td>
-      <td style="text-align:center;">128K，线程数小于4时，为 2048/线程数 K</td>
+      <td style="text-align:center;">单次分片下载数据大小。<br>支持单位（K/M/B），纯数字默认单位为KB。<br>系统限制：最小32KB，最大10MB。</td>
+      <td style="text-align:center;">128KB</td>
     </tr>
     <tr>
       <td style="text-align:center;">thread</td>

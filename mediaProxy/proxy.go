@@ -151,7 +151,15 @@ func ConcurrentDownload(ctx context.Context, downloadUrl string, rangeStart int6
 			return
 		}
 
+		// 这里有一个关键点：我们需要告诉播放器真实的 Content-Length，
+		// 但是我们从网盘下载的速度可能远大于播放器消费的速度。
+		// base.Emitter.Write 内部通过 io.Pipe 阻塞写入，
+		// 这样可以根据播放器的实际消费能力（网速/解码速度）来背压（backpressure）下载协程，
+		// 从而不会无意义地消耗带宽和内存。
 		_, err := emitter.Write(buffer)
+
+		// 增加极微小的睡眠，让出 CPU 切片，帮助缓解瞬间高并发写入时播放器读取跟不上的缓冲暴涨
+		time.Sleep(1 * time.Millisecond)
 
 		if err != nil {
 			if !strings.Contains(err.Error(), "write on closed pipe") && !strings.Contains(err.Error(), "client disconnected") && !strings.Contains(err.Error(), "forcibly closed") && !errors.Is(err, syscall.EPIPE) && !errors.Is(err, syscall.ECONNRESET) {
@@ -195,7 +203,7 @@ func (p *ProxyDownloadStruct) ProxyRead() []byte {
 	if !p.ProxyRunning {
 		return nil
 	}
-	
+
 	buffer := currentChunk.get(p.Ctx)
 	// 如果获取到 nil，说明该 chunk 下载失败（例如 416），停止代理并返回 nil
 	if buffer == nil {
@@ -203,7 +211,7 @@ func (p *ProxyDownloadStruct) ProxyRead() []byte {
 		p.ProxyStop()
 		return nil
 	}
-	
+
 	if len(buffer) == 0 {
 		logrus.Debugf("ProxyRead 接收到空 buffer (len=0)")
 		p.ProxyStop()
@@ -250,8 +258,15 @@ func (p *ProxyDownloadStruct) ProxyWorker(req *http.Request) {
 		chunk = nil
 		startOffset := p.NextChunkStartOffset
 		if startOffset <= p.EndOffset {
-			p.NextChunkStartOffset += p.ChunkSize
-			endOffset := startOffset + p.ChunkSize - 1
+			currentChunkSize := p.ChunkSize
+			// 动态分片：第一个分片强制缩小，以极大降低首包延迟，防止 IjkPlayer 超时
+			// 只有当原始 chunkSize 大于 256KB 时，首包才缩减到 256KB
+			if startOffset == p.startOffset && currentChunkSize > 256*1024 {
+				currentChunkSize = 256 * 1024
+			}
+
+			p.NextChunkStartOffset += currentChunkSize
+			endOffset := startOffset + currentChunkSize - 1
 			if endOffset > p.EndOffset {
 				endOffset = p.EndOffset
 			}
@@ -331,7 +346,7 @@ func (p *ProxyDownloadStruct) ProxyWorker(req *http.Request) {
 							resp = nil
 							break // 跳出重试循环，标记此 chunk 为结束
 						}
-						
+
 						logrus.Debugf("处理 %+v 链接 range=%d-%d 部分失败, statusCode: %+v: %s", p.DownloadUrl, chunk.startOffset, chunk.endOffset, resp.StatusCode(), resp.String())
 						resp = nil
 						break // 跳出重试循环，标记此 chunk 失败
@@ -355,14 +370,14 @@ func (p *ProxyDownloadStruct) ProxyWorker(req *http.Request) {
 				} else {
 					logrus.Debugf("Chunk range=%d-%d 无法获取数据，写入 nil 并停止调度新任务", chunk.startOffset, chunk.endOffset)
 					chunk.put(nil) // 放入 nil 标记此 chunk 失败或结束
-					
+
 					// 停止调度新的 chunk
 					p.ProxyMutex.Lock()
 					if p.NextChunkStartOffset <= p.EndOffset {
 						p.NextChunkStartOffset = p.EndOffset + 1
 					}
 					p.ProxyMutex.Unlock()
-					
+
 					return // 直接结束当前 worker 协程
 				}
 				resp = nil
@@ -372,17 +387,17 @@ func (p *ProxyDownloadStruct) ProxyWorker(req *http.Request) {
 	}
 }
 
-
-
 func handleMethod(w http.ResponseWriter, req *http.Request) {
 	switch req.Method {
-	case http.MethodGet:
-		// 处理 GET 请求
-		logrus.Info("正在 GET 请求")
+	case http.MethodGet, http.MethodHead:
+		// 处理 GET 和 HEAD 请求
+		logrus.Info("正在 GET/HEAD 请求")
 		// 检查查询参数是否为空
 		if req.URL.RawQuery == "" {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			w.Write([]byte("欢迎使用drpyS专用多线程媒体代理服务，由道长于2026年开发"))
+			if req.Method == http.MethodGet {
+				w.Write([]byte("欢迎使用drpyS专用多线程媒体代理服务，由道长于2026年开发"))
+			}
 		} else {
 			// 如果有查询参数，则返回自定义的内容
 			handleGetMethod(w, req)
@@ -403,6 +418,9 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 	url = query.Get("url")
 	strForm := query.Get("form")
 	strHeader := query.Get("headers")
+	if strHeader == "" {
+		strHeader = query.Get("header")
+	}
 	strAuth := query.Get("auth")
 	strThread := req.URL.Query().Get("thread")
 	strSplitSize := req.URL.Query().Get("size")
@@ -458,6 +476,7 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 	}
 	// 强制要求服务器不进行 gzip 压缩，否则可能导致分片数据大小不匹配
 	newHeader["Accept-Encoding"] = []string{"identity"}
+	// ExoPlayer 请求时可能会带上一些额外的控制头，这里我们保留必要的，但要确保我们以原样拉取
 
 	// 移除错误的URL参数追加逻辑，因为这会破坏原始URL
 	// 代理服务应该直接使用解码后的完整URL，而不是修改它
@@ -471,19 +490,46 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 	}
 
 	var statusCode int
-	var rangeStart, rangeEnd = int64(0), int64(0)
+	var rangeStart, rangeEnd = int64(0), int64(-1)
+	var isSuffixRange bool
+	var suffixLength int64
+	var isExactRange bool
+	var originalRequestRange string
+
 	requestRange := req.Header.Get("Range")
-	rangeRegex := regexp.MustCompile(`bytes= *([0-9]+) *- *([0-9]*)`)
-	matchGroup := rangeRegex.FindStringSubmatch(requestRange)
-	if matchGroup != nil {
-		statusCode = 206
-		rangeStart, _ = strconv.ParseInt(matchGroup[1], 10, 64)
-		if len(matchGroup) > 2 && matchGroup[2] != "" {
-			rangeEnd, _ = strconv.ParseInt(matchGroup[2], 10, 64)
+	originalRequestRange = requestRange
+
+	if requestRange != "" {
+		suffixRegex := regexp.MustCompile(`bytes= *-([0-9]+)`)
+		rangeRegex := regexp.MustCompile(`bytes= *([0-9]+) *- *([0-9]*)`)
+
+		if suffixMatch := suffixRegex.FindStringSubmatch(requestRange); suffixMatch != nil {
+			statusCode = 206
+			isSuffixRange = true
+			suffixLength, _ = strconv.ParseInt(suffixMatch[1], 10, 64)
+		} else if matchGroup := rangeRegex.FindStringSubmatch(requestRange); matchGroup != nil {
+			statusCode = 206
+			rangeStart, _ = strconv.ParseInt(matchGroup[1], 10, 64)
+			if len(matchGroup) > 2 && matchGroup[2] != "" {
+				rangeEnd, _ = strconv.ParseInt(matchGroup[2], 10, 64)
+				isExactRange = true
+			} else {
+				// 将其标记为一个特殊的 -1，表示到文件末尾
+				rangeEnd = -1
+			}
+		} else {
+			statusCode = 200
+			rangeStart = 0
+			rangeEnd = -1
 		}
 	} else {
 		statusCode = 200
+		rangeStart = 0
+		rangeEnd = -1
 	}
+
+	// 提前处理 Content-Type 以防影响缓存逻辑
+	// 注意：缓存查询等其他逻辑保留
 
 	cacheTimeKey := url + "#LastModified"
 	lastModifiedCache, found := mediaCache.Get(cacheTimeKey)
@@ -582,19 +628,50 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 			} else if strings.HasSuffix(fileName, ".mp4") || strings.HasSuffix(fileName, ".m4s") || strings.Contains(urlLower, "fext=mp4") || strings.Contains(urlLower, ".mp4") {
 				contentType = "video/mp4"
 			} else {
-				// 保留原始的 application/octet-stream 或者默认为 video/mp4
-				// 对于 ijkplayer，最好让其自己嗅探，所以如果是 octet-stream，就保留
-				if contentType == "" {
-					contentType = "video/mp4" 
-				}
+				// ExoPlayer 如果没有明确类型且为 octet-stream 会报错。
+				// IjkPlayer 在碰到明确错误格式时可能会播放失败。
+				// MPV 等严格的播放器如果遇到强制篡改的 video/mp4 但实际是 mkv 可能会解码失败。
+				// 我们需要做的是：
+				// 1. 尝试从网盘的响应头中原样透传。
+				// 2. 如果实在没有，我们就不设置它，让播放器自己嗅探 (不要强制设为 video/mp4)
 			}
-			responseHeaders.Set("Content-Type", contentType)
+
+			if contentType != "" {
+				responseHeaders.Set("Content-Type", contentType)
+			} else {
+				// 如果实在没有识别出类型，为了最大兼容性，最好删除该头，让 mpv/ijk 等播放器自己根据内容嗅探
+				// 不要给默认的 application/octet-stream，这会让 mpv 困惑
+				responseHeaders.Del("Content-Type")
+			}
 		}
 
 		contentRange := responseHeaders.Get("Content-Range")
 		if contentRange != "" {
 			matchGroup := regexp.MustCompile(`.*/([0-9]+)`).FindStringSubmatch(contentRange)
 			contentSize, _ := strconv.ParseInt(matchGroup[1], 10, 64)
+
+			// 检查是否受限于网盘试看(如迅雷 rg=0-82432800)参数
+			parsedUrl, errUrl := handleUrl.Parse(url)
+			if errUrl == nil {
+				rg := parsedUrl.Query().Get("rg")
+				if rg != "" {
+					rgMatch := regexp.MustCompile(`[0-9]+-([0-9]+)`).FindStringSubmatch(rg)
+					if rgMatch != nil {
+						rgEnd, _ := strconv.ParseInt(rgMatch[1], 10, 64)
+						if rgEnd > 0 && rgEnd < contentSize {
+							contentSize = rgEnd + 1
+							logrus.Debugf("检测到 URL 包含试看范围限制 rg=%s，将文件总大小修正为: %d", rg, contentSize)
+
+							// 同步修改 responseHeaders 中的 Content-Range，防止后续重新解析出旧的 contentSize
+							oldContentRange := responseHeaders.Get("Content-Range")
+							if oldContentRange != "" {
+								newContentRange := regexp.MustCompile(`/([0-9]+)`).ReplaceAllString(oldContentRange, fmt.Sprintf("/%d", contentSize))
+								responseHeaders.Set("Content-Range", newContentRange)
+							}
+						}
+					}
+				}
+			}
 
 			responseHeaders.Set("Content-Length", strconv.FormatInt(contentSize, 10))
 		} else {
@@ -621,6 +698,10 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 			w.Header().Del("Expires")
 			w.Header().Set("Connection", "keep-alive")
 			w.WriteHeader(statusCode)
+
+			if req.Method == http.MethodHead {
+				return
+			}
 
 			buf := make([]byte, 1024*64) // 64KB 缓冲区
 			for {
@@ -666,7 +747,7 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 
 	acceptRange := responseHeaders.Get("Accept-Ranges")
 	contentRange := responseHeaders.Get("Content-Range")
-	if contentRange == "" && acceptRange == "" {
+	if contentRange == "" && acceptRange == "" && responseHeaders.Get("Content-Length") == "" {
 		// 理论上不可达，因为不支持断点续传的请求不会被缓存
 		http.Error(w, "无法处理不支持断点续传的缓存请求", http.StatusInternalServerError)
 		return
@@ -676,17 +757,29 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 		var numTasks int64
 
 		contentSize := int64(0)
-		matchGroup = regexp.MustCompile(`.*/([0-9]+)`).FindStringSubmatch(contentRange)
+		matchGroup := regexp.MustCompile(`.*/([0-9]+)`).FindStringSubmatch(contentRange)
 		if matchGroup != nil {
 			contentSize, _ = strconv.ParseInt(matchGroup[1], 10, 64)
 		} else {
 			contentSize, _ = strconv.ParseInt(responseHeaders.Get("Content-Length"), 10, 64)
 		}
 
-		if rangeEnd == int64(0) || rangeEnd >= contentSize {
+		if isSuffixRange {
+			rangeStart = contentSize - suffixLength
+			if rangeStart < 0 {
+				rangeStart = 0
+			}
 			rangeEnd = contentSize - 1
+		} else {
+			if !isExactRange && (rangeEnd == -1 || rangeEnd >= contentSize) {
+				rangeEnd = contentSize - 1
+			}
+			if rangeStart < 0 {
+				rangeStart = 0
+			}
 		}
-		if rangeStart < contentSize {
+
+		if rangeStart <= rangeEnd && rangeStart < contentSize {
 			if strThread == "" {
 				// 根据文件大小和请求范围自动设置线程数
 				numTasks = 1 // 默认单线程
@@ -707,9 +800,9 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 					numTasks = 1
 				}
 				// 限制最大线程数，防止被服务器封禁（尤其是迅雷等网盘）
-				if numTasks > 16 {
-					logrus.Debugf("请求线程数(%d)过大，限制为16以防止被封禁", numTasks)
-					numTasks = 16
+				if numTasks > 32 {
+					logrus.Debugf("请求线程数(%d)过大，限制为32以防止被封禁", numTasks)
+					numTasks = 32
 				}
 			}
 
@@ -724,69 +817,92 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 					valStr := strings.TrimRight(strings.TrimRight(strSplitSize, "B"), "M")
 					val, _ := strconv.ParseInt(valStr, 10, 64)
 					splitSize = val * 1024 * 1024
+				} else if strings.HasSuffix(strSplitSize, "B") {
+					valStr := strings.TrimRight(strSplitSize, "B")
+					val, _ := strconv.ParseInt(valStr, 10, 64)
+					splitSize = val
 				} else {
-					// 纯数字，如果是256之类的小数字，原版逻辑认为是KB，如果是1024这种，原版逻辑认为是Byte？
-					// 按照 README 里的说法，256K 是带K的。纯数字如果是迅雷等传递过来的，往往是 kb 或者 b?
-					// 之前的逻辑是 splitSize, _ = strconv.ParseInt(strSplitSize, 10, 64)
-					// 这意味着纯数字是 byte 为单位的。
+					// 纯数字，默认单位为 KB
 					val, _ := strconv.ParseInt(strSplitSize, 10, 64)
-					// 如果值太小，很可能单位是 KB
-					if val < 1024*10 {
-						splitSize = val * 1024
-					} else {
-						splitSize = val
-					}
+					splitSize = val * 1024
 				}
 
-				// 动态调整分片大小，结合线程数限制，保障下载速度同时避免过快请求
-				if splitSize < 128*1024 {
-					// 强制分片大小最小为 128KB，避免请求过于频繁
-					splitSizeOriginal := splitSize
-					splitSize = 128 * 1024
-					logrus.Debugf("splitSize adjusted to min 128KB: original=%d", splitSizeOriginal)
+				// 根据媒体资源代理的常识设置合理的上下限
+				// 上限：最大 10MB，避免单次 HTTP 请求过长导致超时或占用过多内存
+				maxSplitSize := int64(10 * 1024 * 1024)
+				// 下限：最小 32KB，避免分片过小导致频繁发起 HTTP 请求（如果用户需要更小，则不建议）
+				minSplitSize := int64(32 * 1024)
+
+				if splitSize > maxSplitSize {
+					logrus.Debugf("splitSize 超过上限 %d，强制调整为 %d", splitSize, maxSplitSize)
+					splitSize = maxSplitSize
+				} else if splitSize < minSplitSize {
+					logrus.Debugf("splitSize 过小 %d，强制调整为最小 %d", splitSize, minSplitSize)
+					splitSize = minSplitSize
 				}
 			} else {
-				// 如果没有传，默认 2MB (之前是128KB，太小会导致请求过于频繁)
-				splitSize = int64(2 * 1024 * 1024)
+				// 如果没有传，默认 128KB
+				splitSize = int64(128 * 1024)
 			}
 
 			logrus.Debugf("Proxy data transfer: thread=%d, splitSize=%d", numTasks, splitSize)
 
-			// 对于 ExoPlayer，我们必须确保返回 Content-Range 时，格式完全正确。
-			// 之前我们使用 fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, contentSize)
-			// 如果 rangeStart == 0 且 rangeEnd == contentSize - 1，有些播放器（特别是ExoPlayer拖拽时）
-			// 会因为缓存和重新请求的 Range 发生冲突。
-			// 同时，必须确保 Accept-Ranges 存在
-			if statusCode == 206 {
-				// ExoPlayer 非常依赖于精确的 Range 回复。如果请求的是 bytes=0-，它可能会检查长度是否一致。
-				// 有些情况下返回 0-X/Y (X = Y - 1) 会被 ExoPlayer 认为不匹配它的期望，导致重置播放或抛出异常。
-				// 因此我们必须确保回复格式完全合规，如果请求没有给结束位置，我们返回到文件末尾。
-				responseHeaders.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, contentSize))
+			// ExoPlayer 兼容性核心：如果请求中有 Range 且要求部分数据，必须返回 206
+			if requestRange != "" || statusCode == 206 {
+				statusCode = 206
+				// 注意：如果请求头中的 Range 只有起点而没有终点 (例如 bytes=12345-)，
+				// 在 HTTP/1.1 标准中，服务器返回的 Content-Range 应该是 `bytes 12345-EOF/TOTAL`
+
+				// ExoPlayer 等播放器在拖拽时，如果获取到的 Content-Length 和它期望的不一致，会重置连接。
+				// 当我们拦截并修改了 Range 后，必须确保返回正确的 Content-Length 和 Content-Range
+				contentLength := rangeEnd - rangeStart + 1
+				if contentLength < 0 {
+					contentLength = 0
+				}
+
+				// 如果是 suffixRange 或者 rangeStart = 0 且没有指定 end 的情况，可能某些播放器需要特定的返回
+				if isSuffixRange {
+					responseHeaders.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, contentSize))
+				} else if originalRequestRange == "bytes=0-" {
+					// 对于原始请求就是 bytes=0- 的情况，我们应该返回完整的 Content-Range
+					responseHeaders.Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", contentSize-1, contentSize))
+				} else if !isExactRange {
+					// 如果没有明确的结束位置，按照原始请求的逻辑可能需要保留开放结尾或者我们已经修正了 rangeEnd
+					responseHeaders.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, contentSize))
+				} else {
+					responseHeaders.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, contentSize))
+				}
+				responseHeaders.Set("Content-Length", strconv.FormatInt(contentLength, 10))
 			} else {
+				statusCode = 200
 				responseHeaders.Del("Content-Range")
+				responseHeaders.Set("Content-Length", strconv.FormatInt(contentSize, 10))
 			}
-			responseHeaders.Set("Content-Length", strconv.FormatInt(rangeEnd-rangeStart+1, 10))
+
 			responseHeaders.Set("Accept-Ranges", "bytes")
 
-			// 必须清理可能干扰播放器 Range 判断的头
-			responseHeaders.Del("Transfer-Encoding") 
+			// 先设置响应头，再开始数据传输
+			responseHeaders.Del("Transfer-Encoding") // 避免播放器因为存在 Chunked 而拒绝解析 Content-Length
 			responseHeaders.Del("Content-Encoding")
-			
-			// 对于 ExoPlayer，我们最好设置一个强缓存标志并且带有 ETag 以支持精确的范围请求
-			// 否则 ExoPlayer 在拖拽时可能会发送没有 If-Range 的请求或者放弃使用现有的 Cache
+
 			for key, values := range responseHeaders {
 				if strings.EqualFold(strings.ToLower(key), "connection") || strings.EqualFold(strings.ToLower(key), "proxy-connection") {
 					continue
 				}
 				w.Header().Set(key, strings.Join(values, ","))
 			}
-			w.Header().Set("Cache-Control", "public, max-age=31536000")
-			w.Header().Del("Pragma")
-			w.Header().Del("Expires")
 
+			// 强制设置缓存头，让播放器尽可能缓存已下载的数据，实现秒切回已缓冲位置
+			w.Header().Set("Cache-Control", "public, max-age=31536000")
 			w.Header().Set("Connection", "keep-alive")
 			w.WriteHeader(statusCode) // 206 for partial content
 
+			if req.Method == http.MethodHead {
+				return
+			}
+
+			// ExoPlayer 会高频拉取，我们需要限制向播放器吐出数据的速度，防止 ExoPlayer 贪婪拉取耗尽内存或带宽
+			// io.CopyBuffer 默认会全速复制，这会导致即使播放器不需要那么多数据，也会被强制塞满 TCP 缓冲区
 			rp, wp := io.Pipe()
 			emitter := base.NewEmitter(rp, wp)
 
@@ -799,8 +915,8 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 
 			go ConcurrentDownload(req.Context(), url, rangeStart, rangeEnd, contentSize, splitSize, numTasks, emitter, req)
 
-			// 响应数据，使用较大的 buffer 提高复制效率
-			buf := make([]byte, 128*1024)
+			// 响应数据，使用较小的 buffer 降低每次复制的吞吐量，配合背压防止 ExoPlayer 贪婪拉取导致带宽暴走
+			buf := make([]byte, 32*1024) // 减小 buffer 强制限制单次搬运速度
 			_, err := io.CopyBuffer(w, emitter, buf)
 			if err != nil && !strings.Contains(err.Error(), "write on closed pipe") && !strings.Contains(err.Error(), "client disconnected") && !strings.Contains(err.Error(), "forcibly closed") && !errors.Is(err, syscall.EPIPE) && !errors.Is(err, syscall.ECONNRESET) {
 				logrus.Debugf("io.Copy error: %v", err)
@@ -935,14 +1051,6 @@ func handleOtherMethod(w http.ResponseWriter, req *http.Request) {
 			R().
 			SetHeaderMultiValues(newHeader).
 			Patch(url)
-	case http.MethodHead:
-		resp, err = base.RestyClient.
-			SetTimeout(10 * time.Second).
-			SetRetryCount(3).
-			SetCookieJar(jar).
-			R().
-			SetHeaderMultiValues(newHeader).
-			Head(url)
 	default:
 		http.Error(w, fmt.Sprintf("无效的Method: %v", req.Method), http.StatusBadRequest)
 	}
@@ -974,7 +1082,7 @@ func shouldFilterHeaderName(key string) bool {
 	}
 	key = strings.ToLower(key)
 	// 移除对 range 头的过滤，允许 Range 请求正常转发
-	return key == "host" || key == "http-client-ip" || key == "remote-addr" || key == "accept-encoding"
+	return key == "host" || key == "http-client-ip" || key == "remote-addr" || key == "accept-encoding" || key == "if-range"
 }
 
 func main() {
