@@ -1,3 +1,5 @@
+Set-Location "$PSScriptRoot\.."
+
 Write-Host "[1/2] Building Android 32-bit (ARM)..."
 $env:CGO_ENABLED="0"
 $env:GOOS="linux"

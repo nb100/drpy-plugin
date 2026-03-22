@@ -15,6 +15,9 @@ param(
 # Set error handling
 $ErrorActionPreference = "Stop"
 
+# Set working directory to project root
+Set-Location "$PSScriptRoot\.."
+
 # Project information
 $AppName = "mediaProxy"
 $BuildDir = "build"

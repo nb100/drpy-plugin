@@ -73,7 +73,7 @@ go run proxy.go -debug -port 5575
 在 `mediaProxy` 目录下，直接运行提供的 PowerShell 脚本：
 
 ```powershell
-./build_goproxy.ps1
+.\scripts\build_goproxy.ps1
 ```
 
 **脚本主要工作**:
@@ -89,7 +89,7 @@ go run proxy.go -debug -port 5575
 在 `mediaProxy` 目录下，运行打包脚本：
 
 ```powershell
-./update_jar.ps1
+.\scripts\update_jar.ps1
 ```
 
 **脚本主要工作**:

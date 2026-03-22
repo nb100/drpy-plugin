@@ -3,6 +3,8 @@ param(
     [string]$SourceDir = "goProxy"
 )
 
+Set-Location "$PSScriptRoot\.."
+
 # Ensure 7z is available
 $7zCmd = Get-Command "7z" -ErrorAction SilentlyContinue
 if (-not $7zCmd) {

@@ -12,6 +12,9 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# 切换到项目根目录
+cd "$(dirname "$0")/.."
+
 # 项目信息
 APP_NAME="mediaProxy"
 VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")

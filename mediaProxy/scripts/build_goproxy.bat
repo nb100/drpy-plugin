@@ -1,6 +1,8 @@
 @echo off
 setlocal
 
+cd /d "%~dp0.."
+
 echo [1/2] Building Android 32-bit (ARM)...
 set CGO_ENABLED=0
 set GOOS=linux

@@ -6,6 +6,9 @@ REM 支持多平台编译，优化二进制文件体积
 
 title MediaProxy Build Script
 
+REM 切换到项目根目录
+cd /d "%~dp0.."
+
 REM 项目信息
 set APP_NAME=mediaProxy
 set BUILD_DIR=build

@@ -13,6 +13,32 @@
 - 🔧 **灵活配置**: 支持动态调整线程数、分片大小等参数
 - 🔐 **安全认证**: 支持自定义认证密钥，保护API访问安全
 
+## 项目结构
+
+```text
+mediaProxy/
+├── base/                   # 核心基础组件
+│   ├── client.go           # HTTP 客户端封装（带重试机制等）
+│   └── emitter.go          # 流式传输控制组件
+├── docs/                   # 项目文档
+│   ├── BUILD_WINDOWS.md    # Windows 编译指南
+│   └── README_DEV.md       # 开发者与调试指南
+├── scripts/                # 构建与打包脚本
+│   ├── build.sh            # Linux/macOS 跨平台编译脚本
+│   ├── build.bat/.ps1      # Windows 跨平台编译脚本
+│   ├── build_goproxy.ps1   # Android(ARM/ARM64) 专属编译脚本
+│   ├── update_jar.ps1      # 打包二进制文件到 custom_spider.jar 的脚本
+│   └── calc_md5.ps1        # 计算 jar 文件 MD5
+├── static/                 # Web 前端静态资源
+│   └── index.html          # 本地代理配置生成页面
+├── build/                  # 跨平台编译输出目录 (由 build 脚本生成)
+├── dist/                   # 跨平台发布包目录 (由 build 脚本生成)
+├── goProxy/                # Android 编译输出目录 (由 build_goproxy 脚本生成)
+├── proxy.go                # 程序入口和主要代理逻辑
+├── custom_spider.jar       # 包含 Android 二进制代理程序的 TVBox 插件包
+└── Dockerfile              # Docker 构建配置
+```
+
 ## 快速开始
 
 ### 运行程序
@@ -84,13 +110,13 @@ curl -X POST "http://localhost:57574/" \
 #### 方法1: 使用构建脚本（推荐）
 ```bash
 # Linux/macOS
-chmod +x build.sh
-./build.sh --all                    # 构建所有平台
-./build.sh --platform linux/amd64   # 构建指定平台
+chmod +x scripts/build.sh
+./scripts/build.sh --all                    # 构建所有平台
+./scripts/build.sh --platform linux/amd64   # 构建指定平台
 
 # Windows
-build.bat                           # 构建所有平台
-build.bat -p windows/amd64          # 构建指定平台
+.\scripts\build.bat                           # 构建所有平台
+.\scripts\build.bat -p windows/amd64          # 构建指定平台
 ```
 
 #### 方法2: 使用Makefile

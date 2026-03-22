@@ -30,15 +30,15 @@ build:
 # 构建所有平台
 build-all: clean deps
 	@echo "构建所有平台..."
-	@chmod +x build.sh
-	@./build.sh --all
+	@chmod +x scripts/build.sh
+	@./scripts/build.sh --all
 
 # 构建指定平台
 # 用法: make build-platform PLATFORM=linux/amd64
 build-platform: clean deps
 	@echo "构建平台: $(PLATFORM)"
-	@chmod +x build.sh
-	@./build.sh --platform $(PLATFORM)
+	@chmod +x scripts/build.sh
+	@./scripts/build.sh --platform $(PLATFORM)
 
 # 开发模式构建（快速构建，不优化）
 dev:

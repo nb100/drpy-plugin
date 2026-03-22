@@ -1,5 +1,6 @@
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$filePath = Join-Path -Path $scriptDir -ChildPath "custom_spider.jar"
+$rootDir = Join-Path -Path $scriptDir -ChildPath ".."
+$filePath = Join-Path -Path $rootDir -ChildPath "custom_spider.jar"
 
 if (Test-Path $filePath) {
     $md5 = (Get-FileHash -Path $filePath -Algorithm MD5).Hash.ToLower()
