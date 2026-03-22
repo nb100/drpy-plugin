@@ -478,7 +478,7 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 	if matchGroup != nil {
 		statusCode = 206
 		rangeStart, _ = strconv.ParseInt(matchGroup[1], 10, 64)
-		if len(matchGroup) > 2 {
+		if len(matchGroup) > 2 && matchGroup[2] != "" {
 			rangeEnd, _ = strconv.ParseInt(matchGroup[2], 10, 64)
 		}
 	} else {
@@ -582,7 +582,11 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 			} else if strings.HasSuffix(fileName, ".mp4") || strings.HasSuffix(fileName, ".m4s") || strings.Contains(urlLower, "fext=mp4") || strings.Contains(urlLower, ".mp4") {
 				contentType = "video/mp4"
 			} else {
-				contentType = "video/mp4" // 默认降级为 mp4，解决播放器无法识别 octet-stream 的问题
+				// 保留原始的 application/octet-stream 或者默认为 video/mp4
+				// 对于 ijkplayer，最好让其自己嗅探，所以如果是 octet-stream，就保留
+				if contentType == "" {
+					contentType = "video/mp4" 
+				}
 			}
 			responseHeaders.Set("Content-Type", contentType)
 		}
@@ -748,8 +752,15 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 
 			logrus.Debugf("Proxy data transfer: thread=%d, splitSize=%d", numTasks, splitSize)
 
-			// 设置正确的Range响应头
+			// 对于 ExoPlayer，我们必须确保返回 Content-Range 时，格式完全正确。
+			// 之前我们使用 fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, contentSize)
+			// 如果 rangeStart == 0 且 rangeEnd == contentSize - 1，有些播放器（特别是ExoPlayer拖拽时）
+			// 会因为缓存和重新请求的 Range 发生冲突。
+			// 同时，必须确保 Accept-Ranges 存在
 			if statusCode == 206 {
+				// ExoPlayer 非常依赖于精确的 Range 回复。如果请求的是 bytes=0-，它可能会检查长度是否一致。
+				// 有些情况下返回 0-X/Y (X = Y - 1) 会被 ExoPlayer 认为不匹配它的期望，导致重置播放或抛出异常。
+				// 因此我们必须确保回复格式完全合规，如果请求没有给结束位置，我们返回到文件末尾。
 				responseHeaders.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, contentSize))
 			} else {
 				responseHeaders.Del("Content-Range")
@@ -757,15 +768,18 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 			responseHeaders.Set("Content-Length", strconv.FormatInt(rangeEnd-rangeStart+1, 10))
 			responseHeaders.Set("Accept-Ranges", "bytes")
 
-			// 先设置响应头，再开始数据传输
-			responseHeaders.Del("Transfer-Encoding") // 避免播放器因为存在 Chunked 而拒绝解析 Content-Length
+			// 必须清理可能干扰播放器 Range 判断的头
+			responseHeaders.Del("Transfer-Encoding") 
+			responseHeaders.Del("Content-Encoding")
+			
+			// 对于 ExoPlayer，我们最好设置一个强缓存标志并且带有 ETag 以支持精确的范围请求
+			// 否则 ExoPlayer 在拖拽时可能会发送没有 If-Range 的请求或者放弃使用现有的 Cache
 			for key, values := range responseHeaders {
 				if strings.EqualFold(strings.ToLower(key), "connection") || strings.EqualFold(strings.ToLower(key), "proxy-connection") {
 					continue
 				}
 				w.Header().Set(key, strings.Join(values, ","))
 			}
-			// 强制设置缓存头，让播放器尽可能缓存已下载的数据，实现秒切回已缓冲位置
 			w.Header().Set("Cache-Control", "public, max-age=31536000")
 			w.Header().Del("Pragma")
 			w.Header().Del("Expires")
