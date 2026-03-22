@@ -277,6 +277,7 @@ func (p *ProxyDownloadStruct) ProxyWorker(req *http.Request) {
 						newHeader[name] = value
 					}
 				}
+				newHeader["Accept-Encoding"] = []string{"identity"}
 
 				maxRetries := 5
 				if startOffset < int64(1048576) || (p.EndOffset-startOffset)/p.EndOffset*1000 < 2 {
@@ -287,7 +288,7 @@ func (p *ProxyDownloadStruct) ProxyWorker(req *http.Request) {
 				var err error
 				for retry := 0; retry < maxRetries; retry++ {
 					resp, err = base.RestyClient.
-						SetTimeout(10*time.Second).
+						SetTimeout(30*time.Second).
 						SetRetryCount(1).
 						SetCookieJar(p.CookieJar).
 						R().
@@ -345,7 +346,12 @@ func (p *ProxyDownloadStruct) ProxyWorker(req *http.Request) {
 
 				// 接收数据
 				if resp != nil {
-					chunk.put(resp.Body())
+					body := resp.Body()
+					expectedLen := int(chunk.endOffset - chunk.startOffset + 1)
+					if len(body) != expectedLen {
+						logrus.Warnf("【警告】收到数据长度不匹配! 请求 range=%d-%d (预期 %d), 实际收到 %d bytes, Content-Range: %s", chunk.startOffset, chunk.endOffset, expectedLen, len(body), resp.Header().Get("Content-Range"))
+					}
+					chunk.put(body)
 				} else {
 					logrus.Debugf("Chunk range=%d-%d 无法获取数据，写入 nil 并停止调度新任务", chunk.startOffset, chunk.endOffset)
 					chunk.put(nil) // 放入 nil 标记此 chunk 失败或结束
@@ -450,6 +456,8 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 			newHeader[name] = value
 		}
 	}
+	// 强制要求服务器不进行 gzip 压缩，否则可能导致分片数据大小不匹配
+	newHeader["Accept-Encoding"] = []string{"identity"}
 
 	// 移除错误的URL参数追加逻辑，因为这会破坏原始URL
 	// 代理服务应该直接使用解码后的完整URL，而不是修改它
@@ -551,27 +559,30 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 		}
 
 		contentType := responseHeaders.Get("Content-Type")
-		if contentType == "" {
-			if strings.HasSuffix(fileName, ".webm") {
+		if contentType == "" || contentType == "application/octet-stream" {
+			urlLower := strings.ToLower(url)
+			if strings.HasSuffix(fileName, ".webm") || strings.Contains(urlLower, "fext=webm") || strings.Contains(urlLower, ".webm") {
 				contentType = "video/webm"
-			} else if strings.HasSuffix(fileName, ".avi") {
+			} else if strings.HasSuffix(fileName, ".avi") || strings.Contains(urlLower, "fext=avi") || strings.Contains(urlLower, ".avi") {
 				contentType = "video/x-msvideo"
-			} else if strings.HasSuffix(fileName, ".wmv") {
+			} else if strings.HasSuffix(fileName, ".wmv") || strings.Contains(urlLower, "fext=wmv") || strings.Contains(urlLower, ".wmv") {
 				contentType = "video/x-ms-wmv"
-			} else if strings.HasSuffix(fileName, ".flv") {
+			} else if strings.HasSuffix(fileName, ".flv") || strings.Contains(urlLower, "fext=flv") || strings.Contains(urlLower, ".flv") {
 				contentType = "video/x-flv"
-			} else if strings.HasSuffix(fileName, ".mov") {
+			} else if strings.HasSuffix(fileName, ".mov") || strings.Contains(urlLower, "fext=mov") || strings.Contains(urlLower, ".mov") {
 				contentType = "video/quicktime"
-			} else if strings.HasSuffix(fileName, ".mkv") {
+			} else if strings.HasSuffix(fileName, ".mkv") || strings.Contains(urlLower, "fext=mkv") || strings.Contains(urlLower, ".mkv") {
 				contentType = "video/x-matroska"
-			} else if strings.HasSuffix(fileName, ".ts") {
+			} else if strings.HasSuffix(fileName, ".ts") || strings.Contains(urlLower, "fext=ts") || strings.Contains(urlLower, ".ts") {
 				contentType = "video/mp2t"
 			} else if strings.HasSuffix(fileName, ".mpeg") || strings.HasSuffix(fileName, ".mpg") {
 				contentType = "video/mpeg"
 			} else if strings.HasSuffix(fileName, ".3gpp") || strings.HasSuffix(fileName, ".3gp") {
 				contentType = "video/3gpp"
-			} else if strings.HasSuffix(fileName, ".mp4") || strings.HasSuffix(fileName, ".m4s") {
+			} else if strings.HasSuffix(fileName, ".mp4") || strings.HasSuffix(fileName, ".m4s") || strings.Contains(urlLower, "fext=mp4") || strings.Contains(urlLower, ".mp4") {
 				contentType = "video/mp4"
+			} else {
+				contentType = "video/mp4" // 默认降级为 mp4，解决播放器无法识别 octet-stream 的问题
 			}
 			responseHeaders.Set("Content-Type", contentType)
 		}
@@ -594,6 +605,7 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 			// const maxBufferSize = 1*1024 // 1KB
 
 			// 必须先写入 Header
+			responseHeaders.Del("Transfer-Encoding")
 			for key, values := range responseHeaders {
 				if strings.EqualFold(strings.ToLower(key), "connection") || strings.EqualFold(strings.ToLower(key), "proxy-connection") {
 					continue
@@ -746,6 +758,7 @@ func handleGetMethod(w http.ResponseWriter, req *http.Request) {
 			responseHeaders.Set("Accept-Ranges", "bytes")
 
 			// 先设置响应头，再开始数据传输
+			responseHeaders.Del("Transfer-Encoding") // 避免播放器因为存在 Chunked 而拒绝解析 Content-Length
 			for key, values := range responseHeaders {
 				if strings.EqualFold(strings.ToLower(key), "connection") || strings.EqualFold(strings.ToLower(key), "proxy-connection") {
 					continue
@@ -844,6 +857,8 @@ func handleOtherMethod(w http.ResponseWriter, req *http.Request) {
 			newHeader[name] = value
 		}
 	}
+	// 强制要求服务器不进行 gzip 压缩
+	newHeader["Accept-Encoding"] = []string{"identity"}
 
 	// 移除错误的URL参数追加逻辑，直接使用解码后的完整URL
 
